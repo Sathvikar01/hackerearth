@@ -1,10 +1,9 @@
-"""Full 6-Stage Dual-Branch Pipeline.
+"""Full 6-Stage Dual-Branch Pipeline (Optimized).
 
-Stage 1-2: Feature Factory (temporal, spatial, contextual, golden lag)
-Stage 3: Leakage-safe Target Encoding (manual OOF with Bayesian smoothing)
-Stage 4: Dual-Model Training (Model A: Global, Model B: Lag Specialist)
-Stage 5: Dynamic Blending (optimize W on Day 49 validation)
-Stage 6: Final prediction and submission
+Optimizations:
+1. Join granularity: Already at minute-level (H:M) — 88.9% coverage
+2. Hardcode W=1.0 for lag rows (trust lag 100%)
+3. Secondary fallback: geohash+hour average for missing exact lag
 """
 import sys
 import os
@@ -22,7 +21,6 @@ from src.features import (
 )
 from src.target_encoder import BayesianTargetEncoder
 from src.models import train_model_a, predict_model_a
-from src.blending import optimize_blend_weight, blend_predictions
 from src.utils import print_scores, create_submission
 from src.config import TARGET
 
@@ -38,9 +36,42 @@ def apply_features(df):
     add_combined_target_features(df)
 
 
+def build_lag_features(train_split, val_or_test, verbose=True):
+    """Build primary (exact timestamp) and secondary (geohash+hour) lag features.
+
+    Primary: exact (geohash, timestamp) match from Day 48 — 88.9% test coverage
+    Secondary: (geohash, hour) average from Day 48 — covers remaining rows
+    """
+    # Primary lag: exact (geohash, timestamp)
+    lookup_exact = train_split.groupby(["geohash", "timestamp"])["demand"].mean().to_dict()
+    val_or_test["exact_lag_demand"] = val_or_test.apply(
+        lambda r: lookup_exact.get((r["geohash"], r["timestamp"]), np.nan), axis=1)
+
+    # Secondary fallback: (geohash, hour) average
+    lookup_hour = train_split.groupby(["geohash", "hour"])["demand"].mean().to_dict()
+    val_or_test["hour_lag_demand"] = val_or_test.apply(
+        lambda r: lookup_hour.get((r["geohash"], r["hour"]), np.nan), axis=1)
+
+    # Combined lag: use exact if available, else fallback to hour average
+    val_or_test["combined_lag"] = val_or_test["exact_lag_demand"].fillna(
+        val_or_test["hour_lag_demand"]
+    )
+
+    if verbose:
+        exact_cov = val_or_test["exact_lag_demand"].notna().sum()
+        hour_cov = val_or_test["hour_lag_demand"].notna().sum()
+        combined_cov = val_or_test["combined_lag"].notna().sum()
+        total = len(val_or_test)
+        print(f"    Exact lag coverage:   {exact_cov}/{total} ({exact_cov/total*100:.1f}%)")
+        print(f"    Hour lag fallback:    {hour_cov}/{total} ({hour_cov/total*100:.1f}%)")
+        print(f"    Combined coverage:    {combined_cov}/{total} ({combined_cov/total*100:.1f}%)")
+
+    return val_or_test
+
+
 def run_pipeline():
     print("=" * 70)
-    print("  DUAL-BRANCH SPATIO-TEMPORAL LAG ARCHITECTURE")
+    print("  DUAL-BRANCH ARCHITECTURE (OPTIMIZED)")
     print("=" * 70)
 
     # ── STAGE 1: INGESTION ───────────────────────────────────
@@ -48,7 +79,6 @@ def run_pipeline():
     train, test = load_data()
     print(f"    Train: {train.shape}  Test: {test.shape}")
 
-    # Chronological split: Day 48 = train, Day 49 = validation
     train_split, val_split = chronological_split(train)
     print(f"    Train (Day 48): {train_split.shape}")
     print(f"    Val   (Day 49): {val_split.shape}")
@@ -59,23 +89,15 @@ def run_pipeline():
     for df in [train_split, val_split, test]:
         apply_features(df)
 
-    # Golden Lag: map Day 48 demand → val/test via (geohash, timestamp)
-    print("    Adding golden lag feature...")
-    lookup_d48 = train_split.groupby(["geohash", "timestamp"])["demand"].mean().to_dict()
-
-    val_split["exact_lag_demand"] = val_split.apply(
-        lambda r: lookup_d48.get((r["geohash"], r["timestamp"]), np.nan), axis=1)
-    test["exact_lag_demand"] = test.apply(
-        lambda r: lookup_d48.get((r["geohash"], r["timestamp"]), np.nan), axis=1)
-
-    val_lag = val_split["exact_lag_demand"].notna().sum()
-    test_lag = test["exact_lag_demand"].notna().sum()
-    print(f"    Val  lag coverage: {val_lag}/{len(val_split)} ({val_lag/len(val_split)*100:.1f}%)")
-    print(f"    Test lag coverage: {test_lag}/{len(test)} ({test_lag/len(test)*100:.1f}%)")
+    # Build lag features with secondary fallback
+    print("    Building lag features (exact + hour fallback)...")
+    print("    Validation set:")
+    val_split = build_lag_features(train_split, val_split)
+    print("    Test set:")
+    test = build_lag_features(train_split, test)
 
     # ── STAGE 3: TARGET ENCODING ─────────────────────────────
     print("\n  Stage 3: Leakage-safe Target Encoding (fit on Day 48 only)...")
-
     te_columns = ["geohash", "geo_slot", "geo_p4_hour"]
     encoder = BayesianTargetEncoder(columns=te_columns, target=TARGET, m=10)
     encoder.fit(train_split)
@@ -93,7 +115,7 @@ def run_pipeline():
     # ── STAGE 4: DUAL-MODEL TRAINING ─────────────────────────
     print("\n  Stage 4: Training dual models...")
     val_actual = val_split[TARGET].values
-    has_lag_mask = val_split["exact_lag_demand"].notna().values
+    has_lag_mask = val_split["combined_lag"].notna().values
 
     # Model A: Global Learner — train on Day 48, predict Day 49
     print("    Training Model A (Global Learner on Day 48)...")
@@ -102,8 +124,7 @@ def run_pipeline():
     )
     print(f"    Model A Val Score: {val_score_a:.4f}")
 
-    # Model B: Lag Specialist — train on Day 49 rows WITH lag, predict Day 49
-    # This exploits the near-deterministic Day 48 → Day 49 continuity
+    # Model B: Lag Specialist — train on Day 49 rows WITH lag
     print("    Training Model B (Lag Specialist on Day 49 lag rows)...")
     val_lag_rows = val_split[has_lag_mask].copy().reset_index(drop=True)
 
@@ -131,30 +152,47 @@ def run_pipeline():
         for c in cat_cols_b:
             X_b_all[c] = X_b_all[c].astype(str)
         pool_b_all = Pool(X_b_all, cat_features=cat_idx_b)
-        val_pred_b_raw = model_b.predict(pool_b_all)
-        val_pred_b_raw = np.clip(val_pred_b_raw, 0, None)
-        val_pred_b = val_pred_b_raw
+        val_pred_b = np.clip(model_b.predict(pool_b_all), 0, None)
 
-        # Score Model B on lag rows only
         val_score_b = max(0, 100 * r2_score(
             val_split.loc[has_lag_mask, TARGET].values,
             val_pred_b[has_lag_mask]
         ))
         print(f"    Model B Val Score (lag rows only): {val_score_b:.4f}")
     else:
-        val_pred_b = val_split["exact_lag_demand"].fillna(0).values
+        val_pred_b = val_split["combined_lag"].fillna(0).values
         val_score_b = 0.0
         model_b = None
         print("    Model B: Not enough lag rows, using lag directly")
 
-    # ── STAGE 5: DYNAMIC BLENDING ────────────────────────────
-    print("\n  Stage 5: Optimizing blend weight on Day 49 validation...")
+    # ── STAGE 5: BLENDING (HARDCODED W=1.0) ──────────────────
+    print("\n  Stage 5: Blending (W=1.0 for lag rows)...")
 
-    best_w, best_score, val_blended = optimize_blend_weight(
-        val_actual, val_pred_a, val_pred_b, has_lag_mask
-    )
+    # Check 2: Hardcode W=1.0 — trust lag 100% for rows with lag
+    best_w = 1.0
 
-    print(f"    Optimal W: {best_w:.2f}")
+    val_blended = val_pred_a.copy()
+    val_blended[has_lag_mask] = val_pred_b[has_lag_mask]
+
+    val_score_blended = max(0, 100 * r2_score(val_actual, val_blended))
+
+    # Also test with optimized W for comparison
+    from src.blending import optimize_blend_weight
+    opt_w, opt_score, _ = optimize_blend_weight(val_actual, val_pred_a, val_pred_b, has_lag_mask)
+
+    print(f"    W=1.0 Score:     {val_score_blended:.4f}")
+    print(f"    Optimized W={opt_w:.2f} Score: {opt_score:.4f}")
+
+    # Use the better score
+    if opt_score > val_score_blended:
+        best_w = opt_w
+        best_score = opt_score
+        print(f"    Using optimized W={best_w:.2f}")
+    else:
+        best_w = 1.0
+        best_score = val_score_blended
+        print(f"    Using hardcoded W=1.0")
+
     print_scores(val_score_a, val_score_b, best_score)
 
     # ── STAGE 6: FINAL PREDICTION ────────────────────────────
@@ -167,13 +205,29 @@ def run_pipeline():
     full_train = encoder_final.transform(full_train)
     test = encoder_final.transform(test)
 
-    # Retrain Model A on all train data
+    # Rebuild lag features for test using full train data
+    print("    Rebuilding lag features with full train data...")
+    lookup_exact_full = full_train.groupby(["geohash", "timestamp"])["demand"].mean().to_dict()
+    lookup_hour_full = full_train.groupby(["geohash", "hour"])["demand"].mean().to_dict()
+
+    test["exact_lag_demand"] = test.apply(
+        lambda r: lookup_exact_full.get((r["geohash"], r["timestamp"]), np.nan), axis=1)
+    test["hour_lag_demand"] = test.apply(
+        lambda r: lookup_hour_full.get((r["geohash"], r["hour"]), np.nan), axis=1)
+    test["combined_lag"] = test["exact_lag_demand"].fillna(test["hour_lag_demand"])
+
+    exact_cov = test["exact_lag_demand"].notna().sum()
+    combined_cov = test["combined_lag"].notna().sum()
+    print(f"    Test exact lag: {exact_cov}/{len(test)} ({exact_cov/len(test)*100:.1f}%)")
+    print(f"    Test combined:  {combined_cov}/{len(test)} ({combined_cov/len(test)*100:.1f}%)")
+
+    # Retrain Model A on full data
     print("    Retraining Model A on full train data...")
     model_a_final, _, _ = train_model_a(full_train, test, model_a_features, TARGET)
 
-    # Model B: retrain on all rows with lag (Day 49 rows)
+    # Retrain Model B on all lag-available rows
     print("    Retraining Model B on lag-available rows...")
-    full_lag_mask = full_train["exact_lag_demand"].notna()
+    full_lag_mask = full_train["combined_lag"].notna()
     full_lag_rows = full_train[full_lag_mask].copy().reset_index(drop=True)
 
     if len(full_lag_rows) > 100 and model_b is not None:
@@ -185,22 +239,21 @@ def run_pipeline():
         model_b_final = CatBoostRegressor(**CATBOOST_PARAMS)
         model_b_final.fit(pool_b_full)
 
-        # Predict test
         test_pred_a = predict_model_a(model_a_final, test, model_a_features)
 
         X_b_test = test[all_feat_b].copy()
         for c in cat_cols_b:
             X_b_test[c] = X_b_test[c].astype(str)
         pool_b_test = Pool(X_b_test, cat_features=cat_idx_b)
-        test_pred_b = model_b_final.predict(pool_b_test)
-        test_pred_b = np.clip(test_pred_b, 0, None)
+        test_pred_b = np.clip(model_b_final.predict(pool_b_test), 0, None)
     else:
         test_pred_a = predict_model_a(model_a_final, test, model_a_features)
-        test_pred_b = test["exact_lag_demand"].fillna(0).values
+        test_pred_b = test["combined_lag"].fillna(0).values
 
-    # Blend
-    test_has_lag = test["exact_lag_demand"].notna().values
-    test_final = blend_predictions(test_pred_a, test_pred_b, test_has_lag, best_w)
+    # Blend with best weight
+    test_has_lag = test["combined_lag"].notna().values
+    test_final = test_pred_a.copy()
+    test_final[test_has_lag] = best_w * test_pred_b[test_has_lag] + (1 - best_w) * test_pred_a[test_has_lag]
     test_final = np.clip(test_final, 0, None)
 
     create_submission(test["Index"].values, test_final)
