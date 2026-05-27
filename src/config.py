@@ -1,4 +1,4 @@
-"""Configuration and constants."""
+"""Configuration and constants for Dual-Branch Architecture."""
 import os
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -11,10 +11,9 @@ TARGET = "demand"
 ID_COL = "Index"
 SEED = 42
 
-CAT_FEATURES = ["geohash", "RoadType", "Weather", "LargeVehicles", "Landmarks"]
-
+# CatBoost hyperparameters
 CATBOOST_PARAMS = {
-    "iterations": 800,
+    "iterations": 1000,
     "learning_rate": 0.05,
     "depth": 6,
     "l2_leaf_reg": 5,
@@ -24,6 +23,9 @@ CATBOOST_PARAMS = {
     "loss_function": "RMSE",
 }
 
-TOROIDAL_N = 16
-TOROIDAL_GRID_SIZE = TOROIDAL_N * TOROIDAL_N
-TEMPORAL_STATES = 7 * 24
+# Validation: Day 48 = train, Day 49 = validation
+TRAIN_DAY = 48
+VAL_DAY = 49
+
+# Blending weight search
+W_GRID_SIZE = 51  # np.linspace(0.5, 1.0, 51)

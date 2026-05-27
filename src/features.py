@@ -1,200 +1,106 @@
-"""Modular feature engineering with rollback support.
+"""Stage 1-2: Feature Factory.
 
-Each feature function takes (train, test) and returns (train, test) with new columns.
-The OOF lookup uses strict out-of-fold calculation to prevent leakage.
+Constructs temporal, spatial, contextual, and golden lag features.
 """
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import KFold
-from src.config import SEED, TEMPORAL_STATES
+import pygeohash
 
 
-# ---------------------------------------------------------------------------
-# Phase 1: Bare-bones (no extra features needed, just raw columns)
-# ---------------------------------------------------------------------------
+def add_temporal_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Cyclical encodings for hour and 15_min_slot."""
+    df["hour_sin"] = np.sin(2 * np.pi * df["hour"] / 24)
+    df["hour_cos"] = np.cos(2 * np.pi * df["hour"] / 24)
+    df["slot_sin"] = np.sin(2 * np.pi * df["15_min_slot"] / 96)
+    df["slot_cos"] = np.cos(2 * np.pi * df["15_min_slot"] / 96)
+    return df
 
 
-# ---------------------------------------------------------------------------
-# Exploit 2A: Geohash → lat/lon
-# ---------------------------------------------------------------------------
-def add_geohash_latlon(train: pd.DataFrame, test: pd.DataFrame) -> tuple:
-    """Decode geohash to latitude and longitude."""
-    import pygeohash
-
-    def decode_geo(gh):
-        lat, lon = pygeohash.decode(gh)
-        return lat, lon
-
-    for df in (train, test):
-        coords = df["geohash"].apply(decode_geo)
-        df["geo_lat"] = coords.apply(lambda x: x[0])
-        df["geo_lon"] = coords.apply(lambda x: x[1])
-
-    return train, test
+def add_spatial_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Decode geohash to lat/lon, extract prefix features."""
+    coords = df["geohash"].apply(lambda g: pygeohash.decode(g))
+    df["latitude"] = coords.apply(lambda x: x[0])
+    df["longitude"] = coords.apply(lambda x: x[1])
+    df["geohash_prefix_3"] = df["geohash"].str[:3]
+    df["geohash_prefix_4"] = df["geohash"].str[:4]
+    return df
 
 
-# ---------------------------------------------------------------------------
-# Exploit 2B: "Perfect Memory" OOF Lookup (vectorized)
-# ---------------------------------------------------------------------------
-def _vectorized_lookup(df_target: pd.DataFrame, lookup_df: pd.DataFrame,
-                       global_mean: float) -> np.ndarray:
-    """Apply cascading fallback lookup using vectorized merge.
+def add_contextual_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Interaction features: RoadType x hour, Weather x Temperature."""
+    df["RoadType_x_hour"] = df["RoadType"].astype(str) + "_" + df["hour"].astype(str)
+    df["Weather_x_Temp"] = df["Weather"].astype(str) + "_" + df["Temperature"].round(0).astype(int).astype(str)
+    return df
 
-    Priority: (geohash, timestamp) → (geohash, hour) → geohash → global_mean
+
+def add_golden_lag(train_split: pd.DataFrame, val_or_test: pd.DataFrame) -> pd.DataFrame:
+    """Create exact_lag_demand from Day 48 based on (geohash, timestamp).
+
+    Maps demand from train_split onto val_or_test using exact (geohash, timestamp) match.
+    Rows without a match get NaN (handled by the blending logic).
     """
-    # Level 1: (geohash, timestamp)
-    stats_ts = lookup_df.groupby(["geohash", "timestamp"])["demand"].mean().reset_index()
-    stats_ts.columns = ["geohash", "timestamp", "_lookup_val"]
-    merged = df_target[["geohash", "timestamp"]].merge(
-        stats_ts, on=["geohash", "timestamp"], how="left"
+    # Build lookup from train_split: (geohash, timestamp) -> demand
+    lookup = train_split.groupby(["geohash", "timestamp"])["demand"].mean().to_dict()
+
+    # Map to val_or_test
+    val_or_test["exact_lag_demand"] = val_or_test.apply(
+        lambda r: lookup.get((r["geohash"], r["timestamp"]), np.nan), axis=1
     )
-    result = merged["_lookup_val"].values
 
-    # Level 2: (geohash, hour) for NaN
-    nan_mask = np.isnan(result)
-    if nan_mask.any():
-        stats_hour = lookup_df.groupby(["geohash", "hour"])["demand"].mean().reset_index()
-        stats_hour.columns = ["geohash", "hour", "_lookup_hour"]
-        merged_h = df_target.loc[nan_mask, ["geohash", "hour"]].merge(
-            stats_hour, on=["geohash", "hour"], how="left"
-        )
-        result[nan_mask] = merged_h["_lookup_hour"].values
+    # Print coverage
+    coverage = val_or_test["exact_lag_demand"].notna().sum()
+    total = len(val_or_test)
+    print(f"    Lag coverage: {coverage}/{total} ({coverage/total*100:.1f}%)")
 
-    # Level 3: geohash for remaining NaN
-    nan_mask = np.isnan(result)
-    if nan_mask.any():
-        stats_geo = lookup_df.groupby("geohash")["demand"].mean().reset_index()
-        stats_geo.columns = ["geohash", "_lookup_geo"]
-        merged_g = df_target.loc[nan_mask, ["geohash"]].merge(
-            stats_geo, on="geohash", how="left"
-        )
-        result[nan_mask] = merged_g["_lookup_geo"].values
-
-    # Level 4: global mean
-    result = np.nan_to_num(result, nan=global_mean)
-    return result
+    return val_or_test
 
 
-def add_demand_lookup_oof(train: pd.DataFrame, test: pd.DataFrame,
-                          n_splits: int = 5) -> tuple:
-    """Add OOF demand lookup feature using strict out-of-fold calculation."""
-    train["demand_lookup"] = np.nan
-    global_mean = train["demand"].mean()
-
-    kf = KFold(n_splits=n_splits, shuffle=True, random_state=SEED)
-
-    for fold, (tr_idx, val_idx) in enumerate(kf.split(train)):
-        tr_fold = train.iloc[tr_idx]
-        val_fold = train.iloc[val_idx]
-        train.loc[train.index[val_idx], "demand_lookup"] = _vectorized_lookup(
-            val_fold, tr_fold, global_mean
-        )
-
-    # For test: use full train lookup
-    test["demand_lookup"] = _vectorized_lookup(test, train, global_mean)
-
-    return train, test
+def add_combined_target_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Create combined string features for target encoding."""
+    df["geo_slot"] = df["geohash"] + "_" + df["15_min_slot"].astype(str)
+    df["geo_p4_hour"] = df["geohash_prefix_4"] + "_" + df["hour"].astype(str)
+    return df
 
 
-# ---------------------------------------------------------------------------
-# Exploit 2C: Chronological Lag (vectorized)
-# ---------------------------------------------------------------------------
-def add_chronological_lag(train: pd.DataFrame, test: pd.DataFrame) -> tuple:
-    """Create demand_1_hour_ago by shifting within geohash, sorted by time.
+def build_features(train_split: pd.DataFrame, val_or_test: pd.DataFrame,
+                   include_lag: bool = True) -> tuple:
+    """Full feature factory pipeline.
 
-    Uses merge_asof for efficient temporal join. Only uses past data.
+    Args:
+        train_split: Training data (Day 48) for lag lookup
+        val_or_test: Validation or test data to add features to
+        include_lag: Whether to add the golden lag feature
+
+    Returns:
+        (train_features, val_features) DataFrames
     """
-    # Build time index: map timestamp to minutes since midnight
-    def ts_to_minutes(ts):
-        h, m = ts.split(":")
-        return int(h) * 60 + int(m)
+    print("  Building features...")
 
-    for df in (train, test):
-        df["_minutes"] = df["timestamp"].apply(ts_to_minutes)
-        df["_time_key"] = df["day"] * 1440 + df["_minutes"]
+    # Apply to both
+    for df in (train_split, val_or_test):
+        df = add_temporal_features(df)
+        df = add_spatial_features(df)
+        df = add_contextual_features(df)
+        df = add_combined_target_features(df)
 
-    # Target time = current time - 60 minutes
-    train["_lag_key"] = train["_time_key"] - 60
-    test["_lag_key"] = test["_time_key"] - 60
+    # Lag feature (only from train_split to val_or_test)
+    if include_lag:
+        val_or_test = add_golden_lag(train_split, val_or_test)
 
-    # Build lookup: (geohash, _time_key) -> demand
-    lag_ref = train[["geohash", "_time_key", "demand"]].copy()
-    lag_ref = lag_ref.rename(columns={"demand": "demand_1_hour_ago", "_time_key": "_lag_key"})
-
-    # Merge train
-    train = train.merge(lag_ref, on=["geohash", "_lag_key"], how="left")
-    train["demand_1_hour_ago"] = train["demand_1_hour_ago"].fillna(0)
-
-    # Merge test (use full train as reference)
-    lag_ref_test = train[["geohash", "_time_key", "demand"]].copy()
-    lag_ref_test = lag_ref_test.rename(columns={"demand": "demand_1_hour_ago_tmp", "_time_key": "_lag_key"})
-    test = test.merge(lag_ref_test, on=["geohash", "_lag_key"], how="left")
-    test["demand_1_hour_ago"] = test.get("demand_1_hour_ago_tmp", pd.Series(dtype=float))
-    if "demand_1_hour_ago_tmp" in test.columns:
-        test.drop(columns=["demand_1_hour_ago_tmp"], inplace=True)
-    test["demand_1_hour_ago"] = test["demand_1_hour_ago"].fillna(0)
-
-    # Cleanup temp columns
-    for df in (train, test):
-        df.drop(columns=["_minutes", "_time_key", "_lag_key"], inplace=True, errors="ignore")
-
-    return train, test
+    return train_split, val_or_test
 
 
-# ---------------------------------------------------------------------------
-# Phase 3: Toroidal Features
-# ---------------------------------------------------------------------------
-def add_toroidal_features(train: pd.DataFrame, test: pd.DataFrame,
-                           toroidal_gen) -> tuple:
-    """Add ToroidalPhase, NeighborhoodEntropy, CollisionFrequency."""
-    demand_map = train.groupby(["day_of_week", "hour"])["demand"].mean().to_dict()
-
-    for df in (train, test):
-        df["toroidal_phase"] = df.apply(
-            lambda r: toroidal_gen.get_toroidal_phase(int(r["day_of_week"]), int(r["hour"])),
-            axis=1,
-        )
-        df["toroidal_neighborhood_entropy"] = df.apply(
-            lambda r: toroidal_gen.get_neighborhood_entropy(
-                int(r["day_of_week"]), int(r["hour"]), demand_map),
-            axis=1,
-        )
-        df["toroidal_collision_frequency"] = df.apply(
-            lambda r: toroidal_gen.get_collision_frequency(
-                int(r["day_of_week"]), int(r["hour"])),
-            axis=1,
-        )
-
-    return train, test
-
-
-# ---------------------------------------------------------------------------
-# Feature registry for rollback system
-# ---------------------------------------------------------------------------
-PHASE1_FEATURES = {
-    "num": ["hour", "minute", "NumberofLanes", "Temperature"],
-    "cat": ["geohash", "RoadType", "Weather", "LargeVehicles", "Landmarks"],
+# Feature lists for different models
+MODEL_A_FEATURES = {
+    "cat": ["geohash", "RoadType", "Weather", "LargeVehicles", "Landmarks",
+            "geohash_prefix_3", "geohash_prefix_4", "RoadType_x_hour", "Weather_x_Temp"],
+    "num": ["hour", "minute", "minute_of_day", "15_min_slot", "day_of_week",
+            "hour_sin", "hour_cos", "slot_sin", "slot_cos",
+            "latitude", "longitude", "Temperature"],
 }
 
-EXPLOITS = {
-    "2A_geohash_latlon": {
-        "func": add_geohash_latlon,
-        "num": ["geo_lat", "geo_lon"],
-        "cat": [],
-    },
-    "2B_demand_lookup": {
-        "func": add_demand_lookup_oof,
-        "num": ["demand_lookup"],
-        "cat": [],
-    },
-    "2C_chronological_lag": {
-        "func": add_chronological_lag,
-        "num": ["demand_1_hour_ago"],
-        "cat": [],
-    },
-}
-
-TOROIDAL_FEATURES = {
-    "num": ["toroidal_phase", "toroidal_neighborhood_entropy", "toroidal_collision_frequency"],
-    "cat": [],
+MODEL_B_FEATURES = {
+    "cat": ["geohash", "geohash_prefix_4"],
+    "num": ["exact_lag_demand", "Temperature", "hour", "minute",
+            "latitude", "longitude", "hour_sin", "hour_cos"],
 }
