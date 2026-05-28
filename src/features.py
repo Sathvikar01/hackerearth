@@ -91,27 +91,61 @@ def add_rotated_coordinates(df: pd.DataFrame, angles: list = None) -> pd.DataFra
     return df
 
 
+def haversine_distance(lat1, lon1, lat2, lon2):
+    """Haversine distance in kilometers between two lat/lon points."""
+    R = 6371.0
+    lat1_r, lon1_r = np.radians(lat1), np.radians(lon1)
+    lat2_r, lon2_r = np.radians(lat2), np.radians(lon2)
+    dlat = lat2_r - lat1_r
+    dlon = lon2_r - lon1_r
+    a = np.sin(dlat / 2) ** 2 + np.cos(lat1_r) * np.cos(lat2_r) * np.sin(dlon / 2) ** 2
+    c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
+    return R * c
+
+
 def add_distance_to_center(df: pd.DataFrame,
                            center_lat: float = None,
                            center_lon: float = None) -> pd.DataFrame:
-    """Euclidean distance from geographic center of the dataset.
+    """Haversine distance from geographic center of the dataset (in km).
 
-    Args:
-        df: DataFrame with 'latitude' and 'longitude'
-        center_lat: Center latitude (auto-computed if None)
-        center_lon: Center longitude (auto-computed if None)
-
-    Returns:
-        DataFrame with 'dist_to_center' column added
+    Replaces the old flat-Euclidean approximation with proper haversine.
     """
     if center_lat is None:
         center_lat = df["latitude"].mean()
     if center_lon is None:
         center_lon = df["longitude"].mean()
 
-    df["dist_to_center"] = np.sqrt(
-        (df["latitude"] - center_lat) ** 2 + (df["longitude"] - center_lon) ** 2
+    df["dist_to_center"] = haversine_distance(
+        df["latitude"].values, df["longitude"].values,
+        center_lat, center_lon
     )
+    return df
+
+
+def add_manhattan_distance(df: pd.DataFrame,
+                           center_lat: float = None,
+                           center_lon: float = None) -> pd.DataFrame:
+    """Manhattan distance approximation using haversine (in km).
+
+    Computes haversine distance for lat and lon separately and sums them.
+    This better represents actual driving distance on a city grid.
+    """
+    if center_lat is None:
+        center_lat = df["latitude"].mean()
+    if center_lon is None:
+        center_lon = df["longitude"].mean()
+
+    # Haversine along latitude only (same longitude)
+    lat_component = haversine_distance(
+        df["latitude"].values, np.full(len(df), center_lon),
+        np.full(len(df), center_lat), np.full(len(df), center_lon)
+    )
+    # Haversine along longitude only (same latitude)
+    lon_component = haversine_distance(
+        np.full(len(df), center_lat), df["longitude"].values,
+        np.full(len(df), center_lat), np.full(len(df), center_lon)
+    )
+    df["manhattan_dist_to_center"] = lat_component + lon_component
     return df
 
 
@@ -338,6 +372,7 @@ def apply_all_features(train_split: pd.DataFrame, val_or_test: pd.DataFrame,
         add_spatial_features(df)
         add_rotated_coordinates(df, angles=[15, 30, 45])
         add_distance_to_center(df)
+        add_manhattan_distance(df)
 
     # Clustering (fit on train, transform both)
     if include_clusters:
@@ -398,8 +433,8 @@ MODEL_A_FEATURES = {
         # Rotated coordinates
         "lat_rot_15", "lon_rot_15", "lat_rot_30", "lon_rot_30",
         "lat_rot_45", "lon_rot_45",
-        # Distance
-        "dist_to_center",
+        # Distance (haversine in km)
+        "dist_to_center", "manhattan_dist_to_center",
         # Contextual
         "Temperature",
         # Geohash statistics

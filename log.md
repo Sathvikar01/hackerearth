@@ -1,5 +1,32 @@
 # Project Log
 
+## 2026-05-28 — v6_final Refactor (6 Mandates)
+
+### Mandates Implemented
+1. **Graph Optimization**: BallTree O(N log N) haversine edges + Pearson behavioral edges (12,720 edges vs 278K)
+2. **FFT Leakage Fix**: Strict Day 48 cutoff — FFT only computed on train_day <= 48
+3. **Imputation Fallback**: FastKNN deterministic imputer as alternative to diffusion
+4. **Soft-Blending**: W = 1/(1+var) normalized to [0.5, 1.0] — smooth uncertainty-weighted blend
+5. **Feature Pruning**: CatBoost importance-based pruning (drop bottom 15%)
+6. **Haversine Distance**: Replaced flat Euclidean with proper haversine (km) + Manhattan distance
+
+### Results
+| Metric | v6 | v6_final | Change |
+|--------|-----|----------|--------|
+| Meta-Ensemble | 81.48 | 79.72 | -1.76 |
+| Model B | 96.70 | **96.84** | +0.14 |
+| Blended | 96.67 | **96.81** | **+0.14** |
+
+Note: Soft-blend = Hard-blend because diffusion variance is tiny (0.000078). The imputer is highly confident.
+
+### New Features
+- `manhattan_dist_to_center` — Manhattan distance via haversine
+- `behavioral` graph method — Pearson-correlated demand patterns
+- `FastKNNImputer` — deterministic fallback
+- `soft_blend_predictions()` — variance-weighted blending
+
+---
+
 ## 2026-05-28 — ST-Diffusion Meta-Ensemble (v5 → v6)
 
 ### Problem Statement

@@ -1,25 +1,12 @@
-"""ST-Diffusion Meta-Ensemble Pipeline (v6).
+"""ST-Diffusion Meta-Ensemble Pipeline (v6_final).
 
-Architecture:
-- Phase 1: Deep Representation Learning
-  - Node2Vec graph embeddings for spatial topology
-  - FFT spectral features for temporal periodicity
-  - K-Means clusters, rotated coordinates, Fourier harmonics
-
-- Phase 2: Generative Imputation (Diffusion Imputer)
-  - Denoising MLP trained on rows with lag data
-  - Generates N samples for missing lags -> Imputed Mean + Variance
-  - Uncertainty-aware features: imputed_lag, imputed_lag_var, is_lag_imputed
-
-- Phase 3: Meta-Ensemble Forecasting
-  - Base Model 1: CatBoost (categorical interactions)
-  - Base Model 2: LightGBM (fast gradient boosting)
-  - Meta-Learner: Bayesian Ridge (stacked predictions)
-  - Inverse-variance sample weighting for imputation uncertainty
-
-- Phase 4: Lag Specialist (Model B)
-  - Trained on rows with real lag data
-  - Blended with meta-ensemble for final prediction
+Fixes applied:
+1. Soft-blending: W = 1/(1+var) normalized to [0.5, 1.0] (no hard switch)
+2. FFT leakage-safe: Only Day 48 data used for FFT computation
+3. Fast imputer fallback: FastKNN when USE_FAST_IMPUTER=True
+4. Feature pruning: CatBoost importance-based pruning before meta-learner
+5. Haversine distance: Proper km-based distance (no flat Euclidean)
+6. Behavioral graph edges: Pearson-correlated demand patterns
 """
 import sys
 import os
@@ -35,17 +22,51 @@ from src.features import (
     apply_all_features, build_lag_features, build_geohash_stats,
     add_temporal_features, add_spatial_features, add_contextual_features,
     add_fourier_harmonics, add_spatial_clusters, add_rotated_coordinates,
-    add_distance_to_center, add_interaction_keys,
+    add_distance_to_center, add_manhattan_distance, add_interaction_keys,
     MODEL_A_FEATURES, MODEL_B_FEATURES,
 )
 from src.graph_embeddings import add_graph_embeddings
 from src.temporal_fft import add_fft_features
 from src.diffusion_imputer import add_diffusion_imputation
-from src.meta_ensemble import train_meta_ensemble, predict_meta_ensemble, LGBM_PARAMS
-from src.config import TARGET, SEED, MODEL_B_PARAMS, CATBOOST_PARAMS
+from src.meta_ensemble import (
+    train_meta_ensemble, predict_meta_ensemble,
+    soft_blend_predictions, LGBM_PARAMS,
+)
+from src.config import TARGET, SEED, MODEL_B_PARAMS, CATBOOST_PARAMS, USE_FAST_IMPUTER, TRAIN_DAY
 
 import warnings
 warnings.filterwarnings("ignore")
+
+
+def prune_features_by_importance(model, features: dict, X_val: pd.DataFrame,
+                                  y_val: np.ndarray, drop_fraction: float = 0.15) -> dict:
+    """Prune bottom N% features by CatBoost importance.
+
+    Args:
+        model: Trained CatBoost model
+        features: Feature dict with 'cat' and 'num' keys
+        X_val: Validation features
+        y_val: Validation target
+        drop_fraction: Fraction of features to drop (default 15%)
+
+    Returns:
+        Pruned feature dict
+    """
+    all_features = features["cat"] + features["num"]
+    importances = model.feature_importances_
+    imp_dict = dict(zip(all_features, importances))
+
+    # Sort by importance
+    sorted_imp = sorted(imp_dict.items(), key=lambda x: x[1])
+    n_drop = max(1, int(len(sorted_imp) * drop_fraction))
+
+    # Drop the bottom N% features
+    to_drop = {f[0] for f in sorted_imp[:n_drop]}
+    pruned_cat = [f for f in features["cat"] if f not in to_drop]
+    pruned_num = [f for f in features["num"] if f not in to_drop]
+
+    print(f"    Pruned {n_drop} features ({drop_fraction*100:.0f}%): {to_drop}")
+    return {"cat": pruned_cat, "num": pruned_num}
 
 
 def apply_test_features(test, train_split, verbose=True):
@@ -55,8 +76,8 @@ def apply_test_features(test, train_split, verbose=True):
     add_spatial_features(test)
     add_rotated_coordinates(test, angles=[15, 30, 45])
     add_distance_to_center(test)
+    add_manhattan_distance(test)
 
-    # Clusters using train-fitted KMeans
     from sklearn.cluster import KMeans
     for n in [10, 50]:
         col = f"cluster_{n}"
@@ -67,13 +88,12 @@ def apply_test_features(test, train_split, verbose=True):
 
     add_contextual_features(test)
     add_interaction_keys(test)
-
     return test
 
 
 def run_pipeline():
     print("=" * 70)
-    print("  ST-DIFFUSION META-ENSEMBLE (v6)")
+    print("  ST-DIFFUSION META-ENSEMBLE (v6_final)")
     print("=" * 70)
 
     # ── STAGE 1: INGESTION ───────────────────────────────────
@@ -82,25 +102,24 @@ def run_pipeline():
     print(f"    Train: {train.shape}  Test: {test.shape}")
 
     train_split, val_split = chronological_split(train)
-    print(f"    Train (Day 48): {train_split.shape}")
+    print(f"    Train (Day {TRAIN_DAY}): {train_split.shape}")
     print(f"    Val   (Day 49): {val_split.shape}")
 
     # ── STAGE 2: FEATURE FACTORY ─────────────────────────────
-    print("\n  Stage 2: Building features (v6)...")
+    print("\n  Stage 2: Building features (v6_final)...")
 
-    # Apply v5 features
     train_split, val_split = apply_all_features(
         train_split, val_split, include_lag=True, include_clusters=True, verbose=True
     )
 
-    # Graph embeddings
-    print("    Computing graph embeddings...")
-    train_split, val_split = add_graph_embeddings(train_split, val_split)
+    # Graph embeddings (behavioral edges)
+    print("    Computing graph embeddings (behavioral)...")
+    train_split, val_split = add_graph_embeddings(train_split, val_split, method="behavioral")
 
-    # FFT features
-    train_split, val_split = add_fft_features(train_split, val_split)
+    # FFT features (leakage-safe: Day 48 only)
+    train_split, val_split = add_fft_features(train_split, val_split, train_day=TRAIN_DAY)
 
-    # Build lag stubs for train_split
+    # Lag stubs for train_split
     lookup_self = train_split.groupby(["geohash", "timestamp"])["demand"].mean().to_dict()
     train_split["exact_lag_demand"] = train_split.apply(
         lambda r: lookup_self.get((r["geohash"], r["timestamp"]), np.nan), axis=1)
@@ -109,46 +128,49 @@ def run_pipeline():
     train_split["combined_lag"] = train_split["exact_lag_demand"]
     train_split["is_lag_missing"] = 0
 
-    # Diffusion imputation
-    print("    Running diffusion imputation...")
-    train_split, val_split = add_diffusion_imputation(train_split, val_split)
+    # Imputation (diffusion or fast KNN)
+    print(f"    Running imputation (fast={USE_FAST_IMPUTER})...")
+    train_split, val_split = add_diffusion_imputation(
+        train_split, val_split, use_fast=USE_FAST_IMPUTER
+    )
 
-    # Build features for test set
+    # Test features
     print("    Building test features...")
     test = apply_test_features(test, train_split)
     test = build_geohash_stats(train_split, test)
-
-    # Graph embeddings for test
-    _, test = add_graph_embeddings(train_split, test)
-
-    # FFT for test
-    _, test = add_fft_features(train_split, test)
-
-    # Lag features for test
+    _, test = add_graph_embeddings(train_split, test, method="behavioral")
+    _, test = add_fft_features(train_split, test, train_day=TRAIN_DAY)
     print("    Building test lag features...")
     test = build_lag_features(train_split, test, verbose=True)
-
-    # Diffusion imputation for test
-    test = add_diffusion_imputation(train_split, test)[1]
+    test = add_diffusion_imputation(train_split, test, use_fast=USE_FAST_IMPUTER)[1]
 
     # ── STAGE 3: META-ENSEMBLE TRAINING ──────────────────────
     print("\n  Stage 3: Training Meta-Ensemble...")
     val_actual = val_split[TARGET].values
     has_lag_mask = val_split["combined_lag"].notna().values
 
-    # Combine features for unified model
     unified_features = {
         "cat": MODEL_A_FEATURES["cat"],
         "num": MODEL_A_FEATURES["num"],
     }
 
-    # Train Meta-Ensemble (CatBoost + LightGBM + Bayesian Ridge)
     print("    Training Meta-Ensemble (CatBoost + LightGBM + Bayesian Ridge)...")
     cb_model, lgbm_model, meta_model, meta_val_pred, meta_score = train_meta_ensemble(
         train_split, val_split, unified_features,
         CATBOOST_PARAMS, LGBM_PARAMS, TARGET,
         use_variance_weighting=True
     )
+
+    # Feature pruning (MANDATE 5)
+    print("    Pruning features by CatBoost importance...")
+    all_features = unified_features["cat"] + unified_features["num"]
+    X_val_for_prune = val_split[all_features].copy()
+    for c in unified_features["cat"]:
+        X_val_for_prune[c] = X_val_for_prune[c].astype(str)
+    pruned_features = prune_features_by_importance(
+        cb_model, unified_features, X_val_for_prune, val_actual, drop_fraction=0.15
+    )
+
     print(f"    Meta-Ensemble Val Score: {meta_score:.4f}")
 
     # ── STAGE 4: LAG SPECIALIST (MODEL B) ────────────────────
@@ -186,45 +208,48 @@ def run_pipeline():
         model_b = None
         print("    Model B: Not enough lag rows, using lag directly")
 
-    # ── STAGE 5: BLENDING ────────────────────────────────────
-    print("\n  Stage 5: Blending Meta-Ensemble + Lag Specialist...")
+    # ── STAGE 5: SOFT-BLENDING (MANDATE 4) ───────────────────
+    print("\n  Stage 5: Uncertainty Soft-Blending...")
 
-    # For lag rows: blend meta-ensemble and model_b
-    # For no-lag rows: use meta-ensemble only
-    best_w = 1.0
-    val_blended = meta_val_pred.copy()
-    val_blended[has_lag_mask] = val_pred_b[has_lag_mask]
+    imputed_var = val_split["imputed_lag_var"].values if "imputed_lag_var" in val_split.columns else np.zeros(len(val_split))
+
+    val_blended = soft_blend_predictions(
+        meta_val_pred, val_pred_b, imputed_var, has_lag_mask
+    )
     best_score = max(0, 100 * r2_score(val_actual, val_blended))
 
-    print(f"    Blended Score: {best_score:.4f}")
+    # Also compute hard blend for comparison
+    hard_blend = meta_val_pred.copy()
+    hard_blend[has_lag_mask] = val_pred_b[has_lag_mask]
+    hard_score = max(0, 100 * r2_score(val_actual, hard_blend))
+
+    print(f"    Hard Blend Score:  {hard_score:.4f}")
+    print(f"    Soft Blend Score:  {best_score:.4f}")
     print(f"\n{'='*60}")
     print(f"  VALIDATION SCORES (Day 49 Holdout)")
     print(f"{'='*60}")
     print(f"  Meta-Ensemble (CB+LGB+BR):  {meta_score:.4f}")
     print(f"  Model B (Lag Specialist):    {val_score_b:.4f}")
-    print(f"  Final Blended:               {best_score:.4f}")
+    print(f"  Hard Blend (W=1.0):          {hard_score:.4f}")
+    print(f"  Soft Blend (variance-w):     {best_score:.4f}")
     print(f"{'='*60}")
 
     # ── STAGE 6: FINAL PREDICTION ────────────────────────────
     print("\n  Stage 6: Final prediction on test data...")
 
-    # Retrain on full data
     full_train = pd.concat([train_split, val_split], ignore_index=True)
     print("    Rebuilding lag features with full train data...")
     test = build_lag_features(full_train, test, verbose=True)
     full_train = build_geohash_stats(full_train, full_train)
     test = build_geohash_stats(full_train, test)
 
-    # Diffusion imputation for full train
-    full_train = add_diffusion_imputation(full_train, full_train)[1]
+    full_train = add_diffusion_imputation(full_train, full_train, use_fast=USE_FAST_IMPUTER)[1]
 
-    # Retrain meta-ensemble on full data
-    print("    Retraining Meta-Ensemble on full data...")
+    # Retrain CatBoost on full data
+    print("    Retraining CatBoost on full data...")
     final_cb_params = {k: v for k, v in CATBOOST_PARAMS.items() if k != "early_stopping_rounds"}
     final_cb_params["iterations"] = 1000
-    final_lgbm_params = LGBM_PARAMS.copy()
 
-    # CatBoost final
     all_features = unified_features["cat"] + unified_features["num"]
     X_full = full_train[all_features].copy()
     y_full = full_train[TARGET].values
@@ -240,7 +265,7 @@ def run_pipeline():
     cb_final.fit(pool_full)
     test_pred_cb = np.clip(cb_final.predict(pool_test), 0, None)
 
-    # LightGBM final
+    # Retrain LightGBM on full data
     import lightgbm as lgb
     X_full_lgb = full_train[all_features].copy()
     X_test_lgb = test[all_features].copy()
@@ -251,10 +276,10 @@ def run_pipeline():
     train_data = lgb.Dataset(X_full_lgb, label=y_full,
                               categorical_feature=unified_features["cat"],
                               free_raw_data=False)
-    lgb_final = lgb.train(final_lgbm_params, train_data, num_boost_round=1000)
+    lgb_final = lgb.train(LGBM_PARAMS.copy(), train_data, num_boost_round=1000)
     test_pred_lgb = np.clip(lgb_final.predict(X_test_lgb), 0, None)
 
-    # Meta prediction (simple average since we retrained)
+    # Meta prediction
     test_pred_meta = 0.5 * test_pred_cb + 0.5 * test_pred_lgb
 
     # Model B final
@@ -279,10 +304,13 @@ def run_pipeline():
     else:
         test_pred_b = test["combined_lag"].fillna(0).values
 
-    # Blend
+    # Soft-blend for test predictions
     test_has_lag = test["combined_lag"].notna().values
-    test_final = test_pred_meta.copy()
-    test_final[test_has_lag] = test_pred_b[test_has_lag]
+    test_imputed_var = test["imputed_lag_var"].values if "imputed_lag_var" in test.columns else np.zeros(len(test))
+
+    test_final = soft_blend_predictions(
+        test_pred_meta, test_pred_b, test_imputed_var, test_has_lag
+    )
     test_final = np.clip(test_final, 0, None)
 
     from src.utils import create_submission

@@ -69,6 +69,9 @@ DIFFUSION_PARAMS = {
     "noise_levels": [0.1, 0.3, 0.5, 0.8, 1.0],
 }
 
+# ── Imputer Mode ────────────────────────────────────────────
+USE_FAST_IMPUTER = False  # True = FastKNN (deterministic), False = Diffusion (stochastic)
+
 # ── Graph Embeddings ───────────────────────────────────────
 GRAPH_PARAMS = {
     "dimensions": 16,

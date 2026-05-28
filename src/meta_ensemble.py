@@ -1,11 +1,9 @@
-"""Meta-Ensemble: CatBoost + LightGBM + Bayesian Ridge Stacking.
+"""Meta-Ensemble with Uncertainty Soft-Blending.
 
-Implements a Level 2 meta-learning pipeline:
 - Base Model 1: CatBoost (categorical interactions)
 - Base Model 2: LightGBM (fast gradient boosting)
-- Meta-Learner: Bayesian Ridge Regression (stacked OOF predictions)
-
-With inverse-variance sample weighting for uncertainty-aware training.
+- Meta-Learner: Bayesian Ridge (stacked predictions)
+- Soft-blending: W = sigmoid(-variance) for smooth uncertainty-weighted blend
 """
 import numpy as np
 import pandas as pd
@@ -16,7 +14,6 @@ import lightgbm as lgb
 
 
 def get_cat_indices(cat_cols: list, all_cols: list) -> list:
-    """Get integer indices of categorical features."""
     return [all_cols.index(c) for c in cat_cols if c in all_cols]
 
 
@@ -24,19 +21,13 @@ def train_catboost_base(X_train: pd.DataFrame, y_train: np.ndarray,
                          X_val: pd.DataFrame, y_val: np.ndarray,
                          cat_cols: list, params: dict,
                          sample_weights: np.ndarray = None) -> tuple:
-    """Train CatBoost base model.
-
-    Returns:
-        (model, val_predictions)
-    """
     all_cols = list(X_train.columns)
     for c in cat_cols:
         X_train[c] = X_train[c].astype(str)
         X_val[c] = X_val[c].astype(str)
     cat_indices = get_cat_indices(cat_cols, all_cols)
 
-    train_pool = Pool(X_train, y_train, cat_features=cat_indices,
-                      weight=sample_weights)
+    train_pool = Pool(X_train, y_train, cat_features=cat_indices, weight=sample_weights)
     val_pool = Pool(X_val, y_val, cat_features=cat_indices)
 
     model = CatBoostRegressor(**params)
@@ -50,12 +41,6 @@ def train_lgbm_base(X_train: pd.DataFrame, y_train: np.ndarray,
                      X_val: pd.DataFrame, y_val: np.ndarray,
                      cat_cols: list, params: dict,
                      sample_weights: np.ndarray = None) -> tuple:
-    """Train LightGBM base model.
-
-    Returns:
-        (model, val_predictions)
-    """
-    # Convert categoricals to category dtype
     for c in cat_cols:
         X_train[c] = X_train[c].astype("category")
         X_val[c] = X_val[c].astype("category")
@@ -76,19 +61,6 @@ def train_lgbm_base(X_train: pd.DataFrame, y_train: np.ndarray,
 def compute_inverse_variance_weights(imputation_variance: np.ndarray,
                                        alpha: float = 10.0,
                                        real_weight: float = 1.0) -> np.ndarray:
-    """Compute inverse-variance sample weights.
-
-    Rows with real lag: weight = real_weight (1.0)
-    Rows with imputed lag: weight = 1 / (1 + alpha * variance)
-
-    Args:
-        imputation_variance: Variance from diffusion imputer (0 for real)
-        alpha: Scaling factor for variance penalty
-        real_weight: Weight for real lag rows
-
-    Returns:
-        Array of sample weights
-    """
     weights = np.where(
         imputation_variance == 0,
         real_weight,
@@ -97,20 +69,32 @@ def compute_inverse_variance_weights(imputation_variance: np.ndarray,
     return weights
 
 
+def compute_soft_blend_weight(imputed_lag_var: np.ndarray) -> np.ndarray:
+    """Compute soft blend weight W using sigmoid of negative variance.
+
+    W = 1 / (1 + variance) — normalized between 0.5 and 1.0
+    - If variance = 0 (exact lag exists): W = 1.0 (100% Model B)
+    - If variance is high: W approaches 0.5 (50/50 blend)
+
+    This replaces the hard switch (W=1.0 for all lag rows) with a smooth,
+    uncertainty-weighted blend that prevents discontinuous prediction curves.
+
+    Args:
+        imputed_lag_var: Variance from diffusion/KNN imputer (0 for real lag)
+
+    Returns:
+        Blend weight W for each row (between 0.5 and 1.0)
+    """
+    W = 1.0 / (1.0 + imputed_lag_var)
+    # Normalize to [0.5, 1.0]
+    W = 0.5 + 0.5 * W
+    return W
+
+
 def train_meta_ensemble(train_df: pd.DataFrame, val_df: pd.DataFrame,
                          features: dict, catboost_params: dict,
                          lgbm_params: dict, target: str = "demand",
                          use_variance_weighting: bool = True) -> tuple:
-    """Train the full meta-ensemble pipeline.
-
-    1. Train CatBoost base model
-    2. Train LightGBM base model
-    3. Stack OOF predictions
-    4. Train Bayesian Ridge meta-learner
-
-    Returns:
-        (catboost_model, lgbm_model, meta_model, val_predictions, val_score)
-    """
     cat_cols = features["cat"]
     num_cols = features["num"]
     all_features = cat_cols + num_cols
@@ -120,7 +104,6 @@ def train_meta_ensemble(train_df: pd.DataFrame, val_df: pd.DataFrame,
     X_val = val_df[all_features].copy()
     y_val = val_df[target].values
 
-    # Compute sample weights from imputation variance
     if use_variance_weighting and "imputed_lag_var" in train_df.columns:
         train_weights = compute_inverse_variance_weights(
             train_df["imputed_lag_var"].values
@@ -128,7 +111,6 @@ def train_meta_ensemble(train_df: pd.DataFrame, val_df: pd.DataFrame,
     else:
         train_weights = None
 
-    # Base Model 1: CatBoost
     print("    Training CatBoost base model...")
     cb_model, cb_val_pred = train_catboost_base(
         X_train.copy(), y_train, X_val.copy(), y_val,
@@ -137,7 +119,6 @@ def train_meta_ensemble(train_df: pd.DataFrame, val_df: pd.DataFrame,
     cb_score = max(0, 100 * r2_score(y_val, cb_val_pred))
     print(f"    CatBoost Score: {cb_score:.4f}")
 
-    # Base Model 2: LightGBM
     print("    Training LightGBM base model...")
     lgbm_model, lgbm_val_pred = train_lgbm_base(
         X_train.copy(), y_train, X_val.copy(), y_val,
@@ -146,10 +127,8 @@ def train_meta_ensemble(train_df: pd.DataFrame, val_df: pd.DataFrame,
     lgbm_score = max(0, 100 * r2_score(y_val, lgbm_val_pred))
     print(f"    LightGBM Score: {lgbm_score:.4f}")
 
-    # Stack predictions for meta-learner
     stacked_train = np.column_stack([cb_val_pred, lgbm_val_pred])
 
-    # Add imputation features if available
     if "imputed_lag_var" in val_df.columns:
         stacked_train = np.column_stack([
             stacked_train,
@@ -157,7 +136,6 @@ def train_meta_ensemble(train_df: pd.DataFrame, val_df: pd.DataFrame,
             val_df["is_lag_imputed"].values if "is_lag_imputed" in val_df.columns else np.zeros(len(val_df)),
         ])
 
-    # Meta-Learner: Bayesian Ridge
     print("    Training Bayesian Ridge meta-learner...")
     meta_model = BayesianRidge()
     meta_model.fit(stacked_train, y_val)
@@ -170,11 +148,6 @@ def train_meta_ensemble(train_df: pd.DataFrame, val_df: pd.DataFrame,
 
 def predict_meta_ensemble(cb_model, lgbm_model, meta_model,
                            test_df: pd.DataFrame, features: dict) -> np.ndarray:
-    """Generate predictions from the full meta-ensemble.
-
-    Returns:
-        Final predictions from the meta-learner
-    """
     cat_cols = features["cat"]
     num_cols = features["num"]
     all_features = cat_cols + num_cols
@@ -183,18 +156,15 @@ def predict_meta_ensemble(cb_model, lgbm_model, meta_model,
     for c in cat_cols:
         X_test[c] = X_test[c].astype(str)
 
-    # CatBoost prediction
     cat_indices = get_cat_indices(cat_cols, all_features)
     test_pool = Pool(X_test, cat_features=cat_indices)
     cb_pred = np.clip(cb_model.predict(test_pool), 0, None)
 
-    # LightGBM prediction
     X_test_lgb = test_df[all_features].copy()
     for c in cat_cols:
         X_test_lgb[c] = X_test_lgb[c].astype("category")
     lgbm_pred = np.clip(lgbm_model.predict(X_test_lgb), 0, None)
 
-    # Stack
     stacked = np.column_stack([cb_pred, lgbm_pred])
 
     if "imputed_lag_var" in test_df.columns:
@@ -204,12 +174,46 @@ def predict_meta_ensemble(cb_model, lgbm_model, meta_model,
             test_df["is_lag_imputed"].values if "is_lag_imputed" in test_df.columns else np.zeros(len(test_df)),
         ])
 
-    # Meta prediction
     final_pred = np.clip(meta_model.predict(stacked), 0, None)
     return final_pred
 
 
-# LightGBM default params
+def soft_blend_predictions(meta_pred: np.ndarray, model_b_pred: np.ndarray,
+                            imputed_lag_var: np.ndarray,
+                            has_lag_mask: np.ndarray) -> np.ndarray:
+    """Uncertainty soft-blending between Meta-Ensemble and Model B.
+
+    Replaces the hard switch (W=1.0 for all lag rows) with a smooth,
+    variance-weighted blend:
+        W = 1 / (1 + variance), normalized to [0.5, 1.0]
+        Final = W * Model_B + (1 - W) * Meta_Ensemble
+
+    For rows with exact lag (variance=0): W=1.0 (100% Model B)
+    For rows with imputed lag (high variance): W approaches 0.5
+
+    Args:
+        meta_pred: Meta-Ensemble predictions
+        model_b_pred: Model B predictions
+        imputed_lag_var: Variance from imputer (0 for real lag)
+        has_lag_mask: Boolean mask for rows with any lag
+
+    Returns:
+        Blended predictions
+    """
+    final = meta_pred.copy()
+
+    # Compute soft blend weight for lag rows
+    W = compute_soft_blend_weight(imputed_lag_var)
+
+    # Apply soft blend only to rows with lag
+    lag_indices = np.where(has_lag_mask)[0]
+    for i in lag_indices:
+        w = W[i]
+        final[i] = w * model_b_pred[i] + (1 - w) * meta_pred[i]
+
+    return final
+
+
 LGBM_PARAMS = {
     "objective": "regression",
     "metric": "rmse",

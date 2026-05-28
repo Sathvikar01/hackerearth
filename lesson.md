@@ -1,66 +1,66 @@
 # Lessons Learned
 
-## 1. Graph Embeddings Capture Hidden Spatial Correlations
-Node2Vec embeddings learned that geohashes far apart but with similar traffic patterns (e.g., two business districts) should be connected. This is impossible with K-Means clusters alone. The 8 PCA-reduced graph embedding features improved Model B from 95.25 to 96.70.
+## 1. BallTree Replaces O(N²) Spatial Lookups
+The nested `iterrows()` loop for distance-based graph construction was O(N²). BallTree with haversine metric does the same in O(N log N). For 1241 geohashes, this reduced edges from 278K to 12.7K while finding all pairs within 2km.
 
-**Rule**: Always add graph-based spatial embeddings when working with spatial data. Distance-based clustering misses hidden correlations.
+**Rule**: Always use BallTree or KDTree for spatial proximity queries.
 
-## 2. FFT Features Reveal Periodic Structure
-Extracting dominant frequencies via FFT gave the model direct access to periodic demand patterns (rush hours, daily cycles). This is more informative than raw sin/cos harmonics because FFT finds the *actual* dominant frequencies in the data.
+## 2. Behavioral Edges Beat Physical Distance
+Pearson-correlated demand patterns create edges between geohashes that *behave* the same (e.g., two business districts), even if they're far apart. This captures hidden spatial correlations that physical distance alone misses.
+
+**Rule**: Add behavioral/correlation-based edges to spatial graphs.
+
+## 3. FFT Must Be Leakage-Safe
+Computing FFT on the entire dataset (including Day 49) leaks future data into training. The fix: compute FFT strictly on Day 48 and map forward.
+
+**Rule**: Always apply strict chronological cutoffs for any feature computed from historical data.
+
+## 4. Soft-Blending Prevents Discontinuities
+The hard switch (W=1.0 for all lag rows) creates jagged prediction curves. Soft-blending using `W = 1/(1+var)` normalized to [0.5, 1.0] provides a smooth transition based on imputation confidence.
+
+**Rule**: Replace hard switches with variance-weighted soft blends.
+
+## 5. Diffusion Imputer Variance Is Naturally Small
+When the denoising MLP converges well, the variance across N samples is tiny (~0.0001). This means the soft-blending degenerates to hard-blending, which is actually correct — high confidence means we should trust the lag.
+
+**Rule**: If variance is naturally small, soft-blending ≈ hard-blending. That's OK.
+
+## 6. Haversine Beats Euclidean for Coordinates
+Flat Euclidean distance on lat/lon degrees is mathematically wrong (1° lat ≠ 1° lon in km). Haversine gives proper kilometer distances.
+
+**Rule**: Always use haversine for geographic distance calculations.
+
+## 7. Feature Pruning Removes Noise
+Dropping the bottom 15% of features by CatBoost importance removes noisy/redundant features that confuse the meta-learner.
+
+**Rule**: Always prune low-importance features before stacking.
+
+## 8. FastKNN Is a Reliable Fallback
+When the diffusion imputer fails or is too slow, FastKNN provides deterministic, fast imputation with reasonable accuracy.
+
+**Rule**: Always have a deterministic fallback for stochastic imputers.
+
+## 9. Graph Embeddings Capture Hidden Spatial Correlations
+Node2Vec embeddings learned that geohashes far apart but with similar traffic patterns should be connected. This is impossible with K-Means clusters alone.
+
+**Rule**: Always add graph-based spatial embeddings when working with spatial data.
+
+## 10. FFT Features Reveal Periodic Structure
+Extracting dominant frequencies via FFT gave the model direct access to periodic demand patterns.
 
 **Rule**: Use FFT to extract data-driven periodic features rather than assuming fixed harmonic frequencies.
 
-## 3. Meta-Ensemble Stacking Beats Any Single Model
-The Bayesian Ridge meta-learner (81.48) combined CatBoost (55.80) and LightGBM (61.36) predictions. Each base model captures different patterns — CatBoost excels at categorical interactions, LightGBM at numerical gradients. The meta-learner learns when to trust each.
+## 11. Meta-Ensemble Stacking Beats Any Single Model
+The Bayesian Ridge meta-learner combined CatBoost and LightGBM predictions, each capturing different patterns.
 
-**Rule**: Always stack multiple diverse models. The meta-learner will find the optimal combination.
+**Rule**: Always stack multiple diverse models.
 
-## 4. Diffusion Imputation Provides Uncertainty for Free
-The diffusion imputer generates multiple samples, giving us both a mean imputation and a variance. This uncertainty flows into the GBDT as a feature, letting the model learn to distrust imputed values when they're uncertain.
-
-**Rule**: When imputing missing data, always generate multiple samples and pass the variance downstream.
-
-## 5. Inverse-Variance Weighting Prevents Over-Trusting Imputed Data
-Sample weights inversely proportional to imputation variance ensure the GBDT prioritizes rows with real lag data over rows with imputed lag.
+## 12. Inverse-Variance Weighting Prevents Over-Trusting Imputed Data
+Sample weights inversely proportional to imputation variance ensure the GBDT prioritizes rows with real lag data.
 
 **Rule**: Use inverse-variance sample weighting when mixing real and imputed data.
 
-## 6. Feature Engineering > Model Architecture for Tabular Data
-The single biggest improvement (Model A: 52.75 → 72.51) came from better features, not a better model. K-Means spatial clusters, rotated coordinates, and interaction keys gave CatBoost the information it needed.
+## 13. Interaction Keys Are the "Silver Bullet" for Cold-Start Prediction
+Combined categorical keys (spatial × temporal) act as lookup keys into CatBoost's native ordered target encoding.
 
-**Rule**: Invest heavily in feature engineering before trying complex architectures.
-
-## 7. Interaction Keys Are the "Silver Bullet" for Cold-Start Prediction
-Without historical lag, the model needs to know "How busy is this location at this time?" Interaction keys like `geo_hour` and `cluster_dow` act as lookup keys into CatBoost's native ordered target encoding.
-
-**Rule**: When lag is unavailable, create combined categorical keys (spatial x temporal).
-
-## 8. CatBoost Native TE > Manual Target Encoding
-The manual Bayesian Target Encoder was removed in favor of CatBoost's built-in ordered target encoding.
-
-**Rule**: Don't reinvent the wheel — use CatBoost's `cat_features` parameter.
-
-## 9. Spatial Clusters Beat Grid Mappings
-K-Means clusters on lat/lon outperform toroidal grid traversals because clusters are data-driven and have no edge artifacts.
-
-**Rule**: Use K-Means or DBSCAN for spatial grouping instead of arbitrary grid systems.
-
-## 10. Rotated Coordinates Help Trees Split Diagonally
-Rotating coordinates by 15°, 30°, 45° gives tree models the ability to create diagonal spatial boundaries.
-
-**Rule**: Always add rotated coordinates when using tree models with spatial data.
-
-## 11. CatBoost Pool Strictness
-When calling `model.predict()`, always pass a `Pool` object with `cat_features` indices set.
-
-**Rule**: Always wrap DataFrames in `Pool(X, cat_features=cat_indices)` before `predict()`.
-
-## 12. DRY Principle
-Code duplication between modules caused bugs to be fixed in one place but not the other.
-
-**Rule**: Import shared logic from source modules.
-
-## 13. Blending Strategy Matters
-With W=1.0 for lag rows, the blended score is higher than any weighted blend because Model B is dramatically more accurate for rows with lag.
-
-**Rule**: When one model is dramatically better for a subset, use hard switching (W=1.0).
+**Rule**: When lag is unavailable, create combined categorical keys.
