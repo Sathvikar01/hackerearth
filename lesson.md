@@ -27,3 +27,6 @@ The test suite was completely blocked by the ImportError. Running tests early wo
 When retraining on full data (no eval set), the code strips `early_stopping_rounds` with dict comprehension. If other eval-dependent params are added later, this will silently break.
 
 **Rule**: Use a dedicated "full train params" config or explicitly whitelist params to keep.
+
+## 6. Impact of Proper Pool Usage
+The CatBoost Pool fix didn't just prevent crashes — it also slightly improved model scores (93.14 → 93.74). This suggests CatBoost may have been silently mishandling categorical features in the raw DataFrame path, leading to degraded predictions even when it didn't crash outright.

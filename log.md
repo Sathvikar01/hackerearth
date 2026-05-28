@@ -26,5 +26,13 @@
 3. **run_pipeline.py**: Same Pool fix applied to the duplicated `train_model_a`
 
 ### Verification
-- [ ] `pytest tests/` passes
-- [ ] `python scripts/run_pipeline.py` runs without CatBoost errors
+- [x] `pytest tests/` — 22/22 passed (0.89s)
+- [x] All imports verified (models.py, config.py, toroidal.py)
+- [x] Git committed and pushed to GitHub (commits c1c3269, 53bfcd2)
+- [x] `python scripts/run_pipeline.py` — runs end-to-end successfully
+
+### Pipeline Results (Post-Fix)
+- Model A (Global Learner): **52.75** (was 52.41 before fix)
+- Model B (Lag Specialist): **95.25** (was 95.13 before fix)
+- Final Blended: **93.74** (was 93.14 before fix)
+- The Pool fix eliminated the CatBoost predict crash and slightly improved scores
