@@ -45,13 +45,14 @@ def train_model_a(train_df: pd.DataFrame, val_df: pd.DataFrame,
         val_pool = Pool(X_val, y_val, cat_features=cat_indices)
         model = CatBoostRegressor(**CATBOOST_PARAMS)
         model.fit(train_pool, eval_set=val_pool, use_best_model=True)
-        val_pred = model.predict(X_val)
+        val_pred = model.predict(val_pool)
         val_pred = np.clip(val_pred, 0, None)
         val_score = max(0, 100 * r2_score(y_val, val_pred))
     else:
         model = CatBoostRegressor(**{k: v for k, v in CATBOOST_PARAMS.items() if k != "early_stopping_rounds"})
         model.fit(train_pool)
-        val_pred = model.predict(X_val)
+        val_pool = Pool(X_val, cat_features=cat_indices)
+        val_pred = model.predict(val_pool)
         val_pred = np.clip(val_pred, 0, None)
         val_score = 0.0
 

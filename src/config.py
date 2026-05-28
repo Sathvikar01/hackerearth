@@ -29,3 +29,8 @@ VAL_DAY = 49
 
 # Blending weight search
 W_GRID_SIZE = 51  # np.linspace(0.5, 1.0, 51)
+
+# Toroidal grid constants (168 temporal states = 7 days x 24 hours)
+TEMPORAL_STATES = 168
+TOROIDAL_N = 16  # 16x16 = 256 cells >= 168 states
+TOROIDAL_GRID_SIZE = TOROIDAL_N * TOROIDAL_N
