@@ -404,11 +404,28 @@ MODEL_A_FEATURES = {
         "Temperature",
         # Geohash statistics
         "geo_demand_mean", "geo_demand_std", "geo_demand_median", "geo_demand_count",
+        # Graph embeddings (Node2Vec PCA)
+        "n2v_pca_0", "n2v_pca_1", "n2v_pca_2", "n2v_pca_3",
+        "n2v_pca_4", "n2v_pca_5", "n2v_pca_6", "n2v_pca_7",
+        # FFT spectral features
+        "fft_amp_0", "fft_amp_1", "fft_amp_2",
+        "fft_phase_0", "fft_phase_1", "fft_phase_2",
+        "fft_dominant_freq", "fft_spectral_energy",
+        # Diffusion imputation features
+        "imputed_lag", "imputed_lag_var",
     ],
 }
 
 MODEL_B_FEATURES = {
     "cat": ["geohash", "geohash_prefix_4"],
-    "num": ["exact_lag_demand", "Temperature", "hour", "minute",
-            "latitude", "longitude", "hour_sin", "hour_cos"],
+    "num": [
+        "exact_lag_demand", "Temperature", "hour", "minute",
+        "latitude", "longitude", "hour_sin", "hour_cos",
+        # Graph embeddings
+        "n2v_pca_0", "n2v_pca_1", "n2v_pca_2", "n2v_pca_3",
+        # FFT features
+        "fft_amp_0", "fft_spectral_energy",
+        # Imputation uncertainty
+        "imputed_lag_var",
+    ],
 }

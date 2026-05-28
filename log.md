@@ -1,5 +1,58 @@
 # Project Log
 
+## 2026-05-28 — ST-Diffusion Meta-Ensemble (v5 → v6)
+
+### Problem Statement
+Model A scored 72.51 and Model B scored 95.25 in v5. The blended score was 95.18. To push beyond 98%, we needed:
+1. Deep spatial representation learning (graph embeddings)
+2. Frequency-domain temporal features (FFT)
+3. Generative imputation for missing lags (diffusion)
+4. Meta-ensemble stacking (CatBoost + LightGBM + Bayesian Ridge)
+
+### Architecture: ST-Diffusion Meta-Ensemble (STD-ME)
+
+**Phase 1: Deep Representation Learning**
+- Node2Vec graph embeddings: Built geohash adjacency graph (1241 nodes, 278K edges), learned 16D embeddings, reduced to 8D via PCA
+- FFT spectral features: Extracted dominant frequencies, amplitudes, phases per geohash
+- 8 graph embedding features + 8 FFT features added
+
+**Phase 2: Generative Imputation**
+- Denoising MLP trained on rows with lag data
+- Generates 10 samples for missing lags -> Imputed Mean + Variance
+- Uncertainty-aware features: imputed_lag, imputed_lag_var, is_lag_imputed
+
+**Phase 3: Meta-Ensemble Forecasting**
+- Base Model 1: CatBoost (categorical interactions) -> 55.80
+- Base Model 2: LightGBM (fast gradient boosting) -> 61.36
+- Meta-Learner: Bayesian Ridge (stacked predictions) -> 81.48
+- Inverse-variance sample weighting for imputation uncertainty
+
+**Phase 4: Lag Specialist + Blending**
+- Model B (CatBoost on lag rows) -> 96.70
+- Blended: W=1.0 for lag rows -> **96.67**
+
+### Results
+
+| Metric | v5 | v6 | Change |
+|--------|-----|-----|--------|
+| Meta-Ensemble | — | 81.48 | New |
+| Model B | 95.25 | 96.70 | +1.5% |
+| **Blended** | 95.18 | **96.67** | **+1.5%** |
+
+### New Modules
+- `src/graph_embeddings.py` — Node2Vec spatial embeddings
+- `src/temporal_fft.py` — FFT spectral features
+- `src/diffusion_imputer.py` — Denoising MLP imputation + uncertainty
+- `src/meta_ensemble.py` — CatBoost + LightGBM + Bayesian Ridge stacking
+
+### Verification
+- [x] All imports verified
+- [x] Pipeline runs end-to-end
+- [x] Submission.csv generated (41778 predictions)
+- [x] Git committed and pushed
+
+---
+
 ## 2026-05-28 — Model A Architecture Overhaul (v4 → v5)
 
 ### Problem Statement

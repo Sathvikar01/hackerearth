@@ -1,4 +1,4 @@
-"""Configuration and constants for Dual-Branch Architecture."""
+"""Configuration and constants for ST-Diffusion Meta-Ensemble Architecture."""
 import os
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -16,11 +16,10 @@ TRAIN_DAY = 48
 VAL_DAY = 49
 
 # Blending weight search
-W_GRID_SIZE = 51  # np.linspace(0.5, 1.0, 51)
+W_GRID_SIZE = 51
 
-# ── Model A: Global Learner (Upgraded) ──────────────────────
-# Deep trees + interaction features + native CatBoost target encoding
-MODEL_A_PARAMS = {
+# ── CatBoost: Base Model (for meta-ensemble) ────────────────
+CATBOOST_PARAMS = {
     "iterations": 3000,
     "learning_rate": 0.03,
     "depth": 8,
@@ -31,7 +30,25 @@ MODEL_A_PARAMS = {
     "loss_function": "RMSE",
 }
 
-# ── Model B: Lag Specialist ─────────────────────────────────
+# ── LightGBM: Base Model (for meta-ensemble) ───────────────
+LGBM_PARAMS = {
+    "objective": "regression",
+    "metric": "rmse",
+    "boosting_type": "gbdt",
+    "learning_rate": 0.05,
+    "num_leaves": 63,
+    "max_depth": 8,
+    "min_child_samples": 20,
+    "feature_fraction": 0.8,
+    "bagging_fraction": 0.8,
+    "bagging_freq": 5,
+    "lambda_l1": 0.1,
+    "lambda_l2": 1.0,
+    "verbose": -1,
+    "seed": SEED,
+}
+
+# ── Model B: Lag Specialist (CatBoost, separate) ───────────
 MODEL_B_PARAMS = {
     "iterations": 1000,
     "learning_rate": 0.05,
@@ -41,4 +58,23 @@ MODEL_B_PARAMS = {
     "verbose": 0,
     "early_stopping_rounds": 50,
     "loss_function": "RMSE",
+}
+
+# ── Diffusion Imputer ──────────────────────────────────────
+DIFFUSION_PARAMS = {
+    "n_samples": 10,
+    "epochs": 30,
+    "lr": 1e-3,
+    "batch_size": 1024,
+    "noise_levels": [0.1, 0.3, 0.5, 0.8, 1.0],
+}
+
+# ── Graph Embeddings ───────────────────────────────────────
+GRAPH_PARAMS = {
+    "dimensions": 16,
+    "n_pca": 8,
+    "walk_length": 20,
+    "num_walks": 50,
+    "p": 1.0,
+    "q": 1.0,
 }
