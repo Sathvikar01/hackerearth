@@ -11,8 +11,28 @@ TARGET = "demand"
 ID_COL = "Index"
 SEED = 42
 
-# CatBoost hyperparameters
-CATBOOST_PARAMS = {
+# Validation: Day 48 = train, Day 49 = validation
+TRAIN_DAY = 48
+VAL_DAY = 49
+
+# Blending weight search
+W_GRID_SIZE = 51  # np.linspace(0.5, 1.0, 51)
+
+# ── Model A: Global Learner (Upgraded) ──────────────────────
+# Deep trees + interaction features + native CatBoost target encoding
+MODEL_A_PARAMS = {
+    "iterations": 3000,
+    "learning_rate": 0.03,
+    "depth": 8,
+    "l2_leaf_reg": 3,
+    "random_seed": SEED,
+    "verbose": 0,
+    "early_stopping_rounds": 200,
+    "loss_function": "RMSE",
+}
+
+# ── Model B: Lag Specialist ─────────────────────────────────
+MODEL_B_PARAMS = {
     "iterations": 1000,
     "learning_rate": 0.05,
     "depth": 6,
@@ -22,15 +42,3 @@ CATBOOST_PARAMS = {
     "early_stopping_rounds": 50,
     "loss_function": "RMSE",
 }
-
-# Validation: Day 48 = train, Day 49 = validation
-TRAIN_DAY = 48
-VAL_DAY = 49
-
-# Blending weight search
-W_GRID_SIZE = 51  # np.linspace(0.5, 1.0, 51)
-
-# Toroidal grid constants (168 temporal states = 7 days x 24 hours)
-TEMPORAL_STATES = 168
-TOROIDAL_N = 16  # 16x16 = 256 cells >= 168 states
-TOROIDAL_GRID_SIZE = TOROIDAL_N * TOROIDAL_N

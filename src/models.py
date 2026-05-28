@@ -1,8 +1,8 @@
-"""Stage 4: Dual-Model CatBoost Training."""
+"""Dual-Model CatBoost Training."""
 import numpy as np
 import pandas as pd
 from catboost import CatBoostRegressor, Pool
-from src.config import CATBOOST_PARAMS, SEED
+from src.config import MODEL_A_PARAMS, MODEL_B_PARAMS, SEED
 
 
 def get_cat_indices(cat_cols: list, all_cols: list) -> list:
@@ -11,8 +11,12 @@ def get_cat_indices(cat_cols: list, all_cols: list) -> list:
 
 
 def train_model_a(train_df: pd.DataFrame, val_df: pd.DataFrame,
-                  features: dict, target: str = "demand") -> tuple:
+                  features: dict, params: dict = None,
+                  target: str = "demand") -> tuple:
     """Train Model A: Global Learner (no lag features).
+
+    Uses CatBoost's native ordered target encoding for all categorical
+    features including high-order interaction keys.
 
     If val_df has target column: train with early stopping on val.
     If val_df has no target (test data): train on train_df only.
@@ -21,6 +25,9 @@ def train_model_a(train_df: pd.DataFrame, val_df: pd.DataFrame,
         (model, val_predictions, val_score)
     """
     from sklearn.metrics import r2_score
+
+    if params is None:
+        params = MODEL_A_PARAMS
 
     cat_cols = features["cat"]
     num_cols = features["num"]
@@ -37,30 +44,29 @@ def train_model_a(train_df: pd.DataFrame, val_df: pd.DataFrame,
         X_val[c] = X_val[c].astype(str)
 
     cat_indices = get_cat_indices(cat_cols, all_features)
-
     train_pool = Pool(X_train, y_train, cat_features=cat_indices)
 
     if has_target:
         y_val = val_df[target].values
         val_pool = Pool(X_val, y_val, cat_features=cat_indices)
-        model = CatBoostRegressor(**CATBOOST_PARAMS)
+        model = CatBoostRegressor(**params)
         model.fit(train_pool, eval_set=val_pool, use_best_model=True)
-        val_pred = model.predict(val_pool)
-        val_pred = np.clip(val_pred, 0, None)
+        val_pred = np.clip(model.predict(val_pool), 0, None)
         val_score = max(0, 100 * r2_score(y_val, val_pred))
     else:
-        model = CatBoostRegressor(**{k: v for k, v in CATBOOST_PARAMS.items() if k != "early_stopping_rounds"})
+        final_params = {k: v for k, v in params.items() if k != "early_stopping_rounds"}
+        model = CatBoostRegressor(**final_params)
         model.fit(train_pool)
         val_pool = Pool(X_val, cat_features=cat_indices)
-        val_pred = model.predict(val_pool)
-        val_pred = np.clip(val_pred, 0, None)
+        val_pred = np.clip(model.predict(val_pool), 0, None)
         val_score = 0.0
 
     return model, val_pred, val_score
 
 
 def train_model_b(train_df: pd.DataFrame, val_df: pd.DataFrame,
-                  features: dict, target: str = "demand") -> tuple:
+                  features: dict, params: dict = None,
+                  target: str = "demand") -> tuple:
     """Train Model B: Lag Specialist (only rows with lag != NaN).
 
     Returns:
@@ -68,11 +74,13 @@ def train_model_b(train_df: pd.DataFrame, val_df: pd.DataFrame,
     """
     from sklearn.metrics import r2_score
 
+    if params is None:
+        params = MODEL_B_PARAMS
+
     cat_cols = features["cat"]
     num_cols = features["num"]
     all_features = cat_cols + num_cols
 
-    # Filter: only rows where exact_lag_demand is NOT NaN
     train_mask = train_df["exact_lag_demand"].notna()
     val_mask = val_df["exact_lag_demand"].notna()
 
@@ -93,22 +101,17 @@ def train_model_b(train_df: pd.DataFrame, val_df: pd.DataFrame,
         X_val[c] = X_val[c].astype(str)
 
     cat_indices = get_cat_indices(cat_cols, all_features)
-
     train_pool = Pool(X_train, y_train, cat_features=cat_indices)
     val_pool = Pool(X_val, y_val, cat_features=cat_indices)
 
-    model = CatBoostRegressor(**CATBOOST_PARAMS)
+    model = CatBoostRegressor(**params)
     model.fit(train_pool, eval_set=val_pool, use_best_model=True)
 
-    # Predict on ALL val rows (fill non-lag rows with 0)
     val_pred_full = np.zeros(len(val_df))
-    val_pred_lag = model.predict(X_val)
-    val_pred_lag = np.clip(val_pred_lag, 0, None)
+    val_pred_lag = np.clip(model.predict(val_pool), 0, None)
     val_pred_full[val_mask] = val_pred_lag
 
-    # Score only on lag rows
     val_score = max(0, 100 * r2_score(y_val, val_pred_lag))
-
     return model, val_pred_full, val_score
 
 
@@ -124,17 +127,11 @@ def predict_model_a(model, test_df: pd.DataFrame, features: dict) -> np.ndarray:
 
     cat_indices = get_cat_indices(cat_cols, all_features)
     test_pool = Pool(X_test, cat_features=cat_indices)
-
-    preds = model.predict(test_pool)
-    return np.clip(preds, 0, None)
+    return np.clip(model.predict(test_pool), 0, None)
 
 
 def predict_model_b(model, test_df: pd.DataFrame, features: dict) -> np.ndarray:
-    """Generate Model B predictions on test data.
-
-    Only predicts rows where exact_lag_demand is NOT NaN.
-    Returns zeros for rows without lag.
-    """
+    """Generate Model B predictions on test data."""
     if model is None:
         return np.zeros(len(test_df))
 
@@ -156,8 +153,6 @@ def predict_model_b(model, test_df: pd.DataFrame, features: dict) -> np.ndarray:
     test_pool = Pool(X_test, cat_features=cat_indices)
 
     preds_full = np.zeros(len(test_df))
-    preds_lag = model.predict(test_pool)
-    preds_lag = np.clip(preds_lag, 0, None)
+    preds_lag = np.clip(model.predict(test_pool), 0, None)
     preds_full[test_mask] = preds_lag
-
     return preds_full
