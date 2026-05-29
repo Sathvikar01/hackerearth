@@ -106,15 +106,30 @@ def apply_test_features(test, train_split, verbose=True):
 
     add_contextual_features(test)
     add_interaction_keys(test)
+    add_geohash_time_interactions(test)  # NEW: geo_dow, geo_hour, geo_slot
     return test
 
 
 def add_minute_features(df):
-    """Add minute-level features."""
+    """Add minute-level and day-of-week features."""
     df['minute_sin'] = np.sin(2 * np.pi * df['minute'] / 60)
     df['minute_cos'] = np.cos(2 * np.pi * df['minute'] / 60)
     df['dow_sin'] = np.sin(2 * np.pi * df['day_of_week'] / 7)
     df['dow_cos'] = np.cos(2 * np.pi * df['day_of_week'] / 7)
+    return df
+
+
+def add_geohash_time_interactions(df):
+    """Add geohash × time interaction features."""
+    # Geohash × day of week interaction
+    df["geo_dow"] = df["geohash"] + "_d" + df["day_of_week"].astype(str)
+    
+    # Geohash × hour interaction  
+    df["geo_hour"] = df["geohash"] + "_h" + df["hour"].astype(str).str.zfill(2)
+    
+    # Geohash × 15_min_slot interaction
+    df["geo_slot"] = df["geohash"] + "_s" + df["15_min_slot"].astype(str).str.zfill(2)
+    
     return df
 
 
@@ -139,10 +154,11 @@ def run_pipeline():
         train_split, val_split, include_lag=True, include_clusters=True, verbose=True
     )
 
-    # Add minute-level features
+    # Add minute-level and interaction features
     for df in (train_split, val_split):
         add_minute_features(df)
         add_distance_to_center(df)
+        add_geohash_time_interactions(df)  # NEW: geo_dow, geo_hour, geo_slot
 
     # Graph embeddings (behavioral edges)
     print("    Computing graph embeddings (behavioral)...")
@@ -174,11 +190,21 @@ def run_pipeline():
     _, test = add_fft_features(train_split, test, train_day=TRAIN_DAY)
     print("    Building test lag features...")
     test = build_lag_features(train_split, test, verbose=True)
+    
+    # IMPROVED: Add global mean fallback for unseen geohash
+    global_mean = train_split["demand"].mean()
+    test["combined_lag"] = test["combined_lag"].fillna(global_mean)
+    exact_count = test["exact_lag_demand"].notna().sum()
+    combined_count = test["combined_lag"].notna().sum()
+    print(f"    Exact lag: {exact_count}/{len(test)} ({exact_count/len(test)*100:.1f}%)")
+    print(f"    Combined (with fallback): {combined_count}/{len(test)} (100.0%)")
+    
     test = add_diffusion_imputation(train_split, test, use_fast=USE_FAST_IMPUTER)[1]
 
-    # Add minute features to test
+    # Add minute and interaction features to test
     add_minute_features(test)
     add_distance_to_center(test)
+    add_geohash_time_interactions(test)  # NEW: geo_dow, geo_hour, geo_slot
 
     # ── STAGE 3: META-ENSEMBLE TRAINING ──────────────────────
     print("\n  Stage 3: Training Meta-Ensemble...")
