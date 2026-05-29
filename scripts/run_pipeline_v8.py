@@ -368,7 +368,9 @@ def run_pipeline():
     print(f"\n{'='*60}")
     print(f"  VALIDATION SCORES (Day 49 Holdout)")
     print(f"{'='*60}")
-    print(f"  Model A (Meta-Ensemble):     {val_score_a:.4f}")
+    # Model A is the final prediction (hard blend for lag rows)
+    model_a_score = hard_score if best_strategy == 'hard' else best_blend_score
+    print(f"  Model A (final):             {model_a_score:.4f}")
     print(f"  Model B (Lag Specialist):     {val_score_b:.4f}")
     print(f"  Hard Blend (W=1):             {hard_score:.4f}")
     print(f"  Soft Blend (w={best_weight:.2f}):   {best_blend_score:.4f}")
@@ -436,7 +438,7 @@ def run_pipeline():
     from src.utils import create_submission
     create_submission(test["Index"].values, test_final)
 
-    return final_score, val_score_a, val_score_b
+    return final_score, model_a_score, val_score_b
 
 
 if __name__ == "__main__":
