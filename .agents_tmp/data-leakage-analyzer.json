@@ -1,0 +1,35 @@
+{
+  "agent": "data-leakage-analyzer",
+  "score": 9,
+  "issues": [
+    {
+      "severity": "INFO",
+      "type": "temporal",
+      "location": "Lag features (exact_lag_demand)",
+      "description": "Lag features use Day 48 demand for Day 49 prediction - this is intentional for time-series but should be documented",
+      "recommendation": "Document that lag features are expected for this problem type"
+    },
+    {
+      "severity": "INFO",
+      "type": "validation",
+      "location": "Data split (train/val)",
+      "description": "Using chronological split (Day 48 for train, Day 49 for validation) - correct approach",
+      "recommendation": "None needed"
+    },
+    {
+      "severity": "LOW",
+      "type": "leakage-safe",
+      "location": "FFT spectral features",
+      "description": "FFT features computed on Day 48 only (leakage-safe)",
+      "recommendation": "Ensure FFT is only computed on historical data"
+    },
+    {
+      "severity": "INFO",
+      "type": "imputation",
+      "location": "Diffusion imputer",
+      "description": "Imputer trained on train, applied to val - no leakage",
+      "recommendation": "None needed"
+    }
+  ],
+  "summary": "Found 4 issues. No critical leakage detected."
+}

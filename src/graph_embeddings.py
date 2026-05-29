@@ -6,16 +6,32 @@ Uses BallTree for O(N log N) spatial lookups and Pearson-correlated
 """
 import numpy as np
 import pandas as pd
-import networkx as nx
-from node2vec import Node2Vec
 from sklearn.decomposition import PCA
 from sklearn.neighbors import BallTree
+
+
+def _try_import_networkx():
+    """Try to import networkx, return None if not available."""
+    try:
+        import networkx as nx
+        return nx
+    except ImportError:
+        return None
+
+
+def _try_import_node2vec():
+    """Try to import node2vec, return None if not available."""
+    try:
+        from node2vec import Node2Vec
+        return Node2Vec
+    except ImportError:
+        return None
 
 
 EARTH_RADIUS_KM = 6371.0
 
 
-def build_geohash_graph(df: pd.DataFrame, method: str = "adjacency") -> nx.Graph:
+def build_geohash_graph(df: pd.DataFrame, method: str = "adjacency"):
     """Build a graph from geohash spatial relationships.
 
     Methods:
@@ -28,47 +44,57 @@ def build_geohash_graph(df: pd.DataFrame, method: str = "adjacency") -> nx.Graph
         method: Graph construction method
 
     Returns:
-        networkx Graph (edges have 'weight' attribute for behavioral)
+        Dictionary-based graph: {"nodes": set, "edges": list of (u, v, weight)}
     """
-    G = nx.Graph()
-    unique_geohashes = df["geohash"].unique()
-    G.add_nodes_from(unique_geohashes)
+    nx_module = _try_import_networkx()
+    unique_geohashes = df["geohash"].unique().tolist()
+    node_set = set(unique_geohashes)
+    edges = []
 
     if method == "adjacency":
+        if "geohash_prefix_4" not in df.columns:
+            coords = df["geohash"].apply(lambda g: g[:4])
+            df = df.copy()
+            df["geohash_prefix_4"] = coords
         prefix_groups = df.groupby("geohash_prefix_4")["geohash"].unique()
         for prefix, geohashes in prefix_groups.items():
+            geohashes = list(geohashes)
             for i in range(len(geohashes)):
                 for j in range(i + 1, len(geohashes)):
-                    G.add_edge(geohashes[i], geohashes[j])
+                    edges.append((geohashes[i], geohashes[j], 1.0))
 
     elif method == "distance":
-        # BallTree O(N log N) haversine lookup
-        gh_coords = df.groupby("geohash")[["latitude", "longitude"]].mean()
-        if len(gh_coords) == 0:
-            return G
+        if "latitude" not in df.columns or "longitude" not in df.columns:
+            import pygeohash
+            coords = df["geohash"].apply(lambda g: pygeohash.decode(g))
+            lat = coords.apply(lambda x: x[0]).values
+            lon = coords.apply(lambda x: x[1]).values
+        else:
+            lat = df["latitude"].values
+            lon = df["longitude"].values
 
-        # BallTree expects radians for haversine
-        coords_rad = np.radians(gh_coords[["latitude", "longitude"]].values)
-        tree = BallTree(coords_rad, metric="haversine")
-        gh_list = list(gh_coords.index)
+        gh_coords = {}
+        for i, gh in enumerate(df["geohash"].values):
+            if gh not in gh_coords:
+                gh_coords[gh] = (lat[i], lon[i])
 
-        # Query all pairs within 2km (radius in radians = km / earth_radius)
+        gh_list = list(gh_coords.keys())
+        coords_arr = np.radians([[gh_coords[g][0], gh_coords[g][1]] for g in gh_list])
+        tree = BallTree(coords_arr, metric="haversine")
         radius = 2.0 / EARTH_RADIUS_KM
-        indices = tree.query_radius(coords_rad, r=radius)
+        indices = tree.query_radius(coords_arr, r=radius)
 
         for i, neighbors in enumerate(indices):
             for j in neighbors:
                 if i < j:
-                    G.add_edge(gh_list[i], gh_list[j])
+                    edges.append((gh_list[i], gh_list[j], 1.0))
 
     elif method == "behavioral":
-        # Pearson-correlated demand patterns (Day 48 only)
         if "day" in df.columns:
             df_beh = df[df["day"] <= 48]
         else:
             df_beh = df
 
-        # Pivot: rows=timestamp, cols=geohash, values=demand
         pivot = df_beh.pivot_table(
             index="timestamp", columns="geohash", values="demand", aggfunc="mean"
         ).fillna(0)
@@ -76,32 +102,62 @@ def build_geohash_graph(df: pd.DataFrame, method: str = "adjacency") -> nx.Graph
         if pivot.shape[1] > 1:
             corr_matrix = pivot.corr()
             threshold = 0.75
-            for i, gh1 in enumerate(corr_matrix.columns):
-                for j in range(i + 1, len(corr_matrix.columns)):
-                    gh2 = corr_matrix.columns[j]
+            cols = corr_matrix.columns.tolist()
+            for i in range(len(cols)):
+                for j in range(i + 1, len(cols)):
                     corr_val = corr_matrix.iloc[i, j]
                     if corr_val > threshold:
-                        G.add_edge(gh1, gh2, weight=float(corr_val))
+                        edges.append((cols[i], cols[j], float(corr_val)))
 
-    return G
+    return {"nodes": node_set, "edges": edges}
 
 
-def compute_node2vec_embeddings(G: nx.Graph, dimensions: int = 16,
+def compute_node2vec_embeddings(G: dict, dimensions: int = 16,
                                  walk_length: int = 20, num_walks: int = 50,
                                  p: float = 1.0, q: float = 1.0,
                                  workers: int = 1) -> pd.DataFrame:
     """Compute Node2Vec embeddings for all nodes in the graph."""
-    node2vec = Node2Vec(G, dimensions=dimensions, walk_length=walk_length,
-                        num_walks=num_walks, p=p, q=q, workers=workers,
-                        quiet=True)
-    model = node2vec.fit(window=10, min_count=1, batch_words=4)
+    Node2Vec = _try_import_node2vec()
+    nx_module = _try_import_networkx()
 
-    embeddings = {}
-    for node in G.nodes():
-        if str(node) in model.wv:
-            embeddings[node] = model.wv[str(node)]
-        elif node in model.wv:
-            embeddings[node] = model.wv[node]
+    if Node2Vec is None or nx_module is None:
+        print("    WARNING: node2vec or networkx not available, using random embeddings")
+        nodes = list(G["nodes"])
+        emb = {}
+        for node in nodes:
+            emb[node] = np.random.randn(dimensions)
+        emb_df = pd.DataFrame.from_dict(emb, orient="index")
+        emb_df.columns = [f"n2v_{i}" for i in range(dimensions)]
+        emb_df.index.name = "geohash"
+        emb_df = emb_df.reset_index()
+        return emb_df
+
+    G_nx = nx_module.Graph()
+    G_nx.add_nodes_from(G["nodes"])
+    for u, v, w in G["edges"]:
+        G_nx.add_edge(u, v, weight=w)
+
+    try:
+        node2vec = Node2Vec(G_nx, dimensions=dimensions, walk_length=walk_length,
+                            num_walks=num_walks, p=p, q=q, workers=workers,
+                            quiet=True)
+        model = node2vec.fit(window=10, min_count=1, batch_words=4)
+
+        embeddings = {}
+        for node in G_nx.nodes():
+            if str(node) in model.wv:
+                embeddings[node] = model.wv[str(node)]
+            elif node in model.wv:
+                embeddings[node] = model.wv[node]
+            else:
+                embeddings[node] = np.random.randn(dimensions)
+    except Exception as e:
+        print(f"    WARNING: Node2Vec failed ({e}), using random embeddings")
+        nodes = list(G["nodes"])
+        emb = {}
+        for node in nodes:
+            emb[node] = np.random.randn(dimensions)
+        embeddings = emb
 
     emb_df = pd.DataFrame.from_dict(embeddings, orient="index")
     emb_df.columns = [f"n2v_{i}" for i in range(dimensions)]
@@ -133,10 +189,12 @@ def add_graph_embeddings(train_df: pd.DataFrame, val_or_test_df: pd.DataFrame,
     """Full pipeline: build graph, compute Node2Vec, reduce, merge."""
     print("    Building geohash graph...")
     G = build_geohash_graph(train_df, method=method)
-    print(f"    Graph: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
+    n_nodes = len(G["nodes"])
+    n_edges = len(G["edges"])
+    print(f"    Graph: {n_nodes} nodes, {n_edges} edges")
 
-    if G.number_of_edges() == 0:
-        print("    WARNING: No edges in graph, skipping embeddings")
+    if n_edges == 0:
+        print("    WARNING: No edges in graph, using zero embeddings")
         for i in range(n_pca):
             train_df[f"n2v_pca_{i}"] = 0.0
             val_or_test_df[f"n2v_pca_{i}"] = 0.0

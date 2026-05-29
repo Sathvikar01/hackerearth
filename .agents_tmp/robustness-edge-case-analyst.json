@@ -1,0 +1,35 @@
+{
+  "agent": "robustness-edge-case-analyst",
+  "score": 6,
+  "issues": [
+    {
+      "severity": "INFO",
+      "type": "existing",
+      "location": "NaN handling",
+      "description": "NaN handling present (isna, notna, fillna)",
+      "recommendation": "Good"
+    },
+    {
+      "severity": "MEDIUM",
+      "type": "gap",
+      "location": "Lag fallback",
+      "description": "Using combined_lag (exact + fuzzy + hour) as fallback chain",
+      "recommendation": "Consider adding global mean as final fallback"
+    },
+    {
+      "severity": "INFO",
+      "type": "existing",
+      "location": "Prediction bounds",
+      "description": "Predictions are clipped to [0, max]",
+      "recommendation": "Good"
+    },
+    {
+      "severity": "HIGH",
+      "type": "edge-case",
+      "location": "Categorical handling",
+      "description": "No explicit fallback for unseen geohash categories",
+      "recommendation": "Add fallback to global mean for new geohashes"
+    }
+  ],
+  "summary": "Found 4 issues. Main concern is unseen category handling."
+}
