@@ -201,10 +201,9 @@ def run_pipeline():
         MODEL_A_PARAMS_V8, LGBM_PARAMS, TARGET,
         use_variance_weighting=True
     )
-
-    # Score on all validation rows
     val_score_a = max(0, 100 * r2_score(val_actual, meta_val_pred))
     print(f"    Model A (Meta-Ensemble) Val Score: {val_score_a:.4f}")
+
 
     # ── STAGE 4: LAG SPECIALIST (MODEL B) ────────────────────
     print("\n  Stage 4: Training Lag Specialist (Model B)...")
