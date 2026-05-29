@@ -195,14 +195,68 @@ def run_pipeline():
         ],
     }
 
-    print("    Training Meta-Ensemble (CatBoost + LightGBM + Bayesian Ridge)...")
-    cb_model, lgbm_model, meta_model, meta_val_pred, meta_score = train_meta_ensemble(
-        train_split, val_split, model_a_features,
-        MODEL_A_PARAMS_V8, LGBM_PARAMS, TARGET,
-        use_variance_weighting=True
-    )
-    val_score_a = max(0, 100 * r2_score(val_actual, meta_val_pred))
-    print(f"    Model A (Meta-Ensemble) Val Score: {val_score_a:.4f}")
+    # Direct CatBoost + LightGBM training
+    print("    Training CatBoost on all rows with lag features...")
+    
+    all_features_a = model_a_features["cat"] + model_a_features["num"]
+    
+    X_train_a = train_split[all_features_a].copy()
+    y_train_a = train_split[TARGET].values
+    X_val_a = val_split[all_features_a].copy()
+    y_val_a = val_actual.copy()
+    
+    for c in model_a_features["cat"]:
+        X_train_a[c] = X_train_a[c].astype(str)
+        X_val_a[c] = X_val_a[c].astype(str)
+    
+    cat_idx_a = [all_features_a.index(c) for c in model_a_features["cat"]]
+    train_pool_a = Pool(X_train_a, y_train_a, cat_features=cat_idx_a)
+    val_pool_a = Pool(X_val_a, y_val_a, cat_features=cat_idx_a)
+    
+    model_a_cb = CatBoostRegressor(**MODEL_A_PARAMS_V8)
+    model_a_cb.fit(train_pool_a, eval_set=val_pool_a, use_best_model=True)
+    val_pred_a_cb = np.clip(model_a_cb.predict(val_pool_a), 0, None)
+    val_score_a_cb = max(0, 100 * r2_score(y_val_a, val_pred_a_cb))
+    print(f"    CatBoost (all rows) Val Score: {val_score_a_cb:.4f}")
+    
+    # Also train LightGBM
+    X_train_a_lgb = X_train_a.copy()
+    X_val_a_lgb = X_val_a.copy()
+    for c in model_a_features["cat"]:
+        X_train_a_lgb[c] = X_train_a_lgb[c].astype("category")
+        X_val_a_lgb[c] = X_val_a_lgb[c].astype("category")
+    
+    train_data_a = lgb.Dataset(X_train_a_lgb, label=y_train_a,
+                                categorical_feature=model_a_features["cat"],
+                                free_raw_data=False)
+    val_data_a = lgb.Dataset(X_val_a_lgb, label=y_val_a,
+                             categorical_feature=model_a_features["cat"],
+                             free_raw_data=False, reference=train_data_a)
+    
+    callbacks = [lgb.early_stopping(50, verbose=False), lgb.log_evaluation(0)]
+    model_a_lgb = lgb.train(LGBM_PARAMS, train_data_a, valid_sets=[val_data_a],
+                           num_boost_round=2000, callbacks=callbacks)
+    val_pred_a_lgb = np.clip(model_a_lgb.predict(X_val_a_lgb), 0, None)
+    val_score_a_lgb = max(0, 100 * r2_score(y_val_a, val_pred_a_lgb))
+    print(f"    LightGBM (all rows) Val Score: {val_score_a_lgb:.4f}")
+    
+    # Meta prediction (50/50 blend)
+    val_pred_a_meta = 0.5 * val_pred_a_cb + 0.5 * val_pred_a_lgb
+    val_score_a_meta = max(0, 100 * r2_score(y_val_a, val_pred_a_meta))
+    print(f"    Meta (CB+LGB) Val Score: {val_score_a_meta:.4f}")
+    
+    # Use best
+    if val_score_a_meta >= max(val_score_a_cb, val_score_a_lgb):
+        val_score_a = val_score_a_meta
+        meta_val_pred = val_pred_a_meta
+    elif val_score_a_cb >= val_score_a_lgb:
+        val_score_a = val_score_a_cb
+        meta_val_pred = val_pred_a_cb
+    else:
+        val_score_a = val_score_a_lgb
+        meta_val_pred = val_pred_a_lgb
+    
+    print(f"    Model A (best): {val_score_a:.4f}")
 
 
     # ── STAGE 4: LAG SPECIALIST (MODEL B) ────────────────────
